@@ -11,10 +11,8 @@ The first version deliberately uses the simplest Google Drive connection:
 - The bot writes transferred files to the mounted Drive folder through the normal filesystem interface.
 - Google Drive API is **not part of the first version**.
 - Colab is temporary execution/storage only; Google Drive is the permanent destination.
-- For the first version, transfers that require downloading data are staged temporarily in Colab and then moved into the mounted Drive folder. Temporary source files are removed after the Drive copy is verified.
-- True cloud-to-cloud transfer that bypasses Colab is deferred until a concrete source/transfer method justifies adding it. We do not add Drive API or another transfer service merely for theoretical direct-transfer support.
-
-This decision intentionally favors a small, understandable, testable system over premature infrastructure.
+- Transfers that require downloading data are staged temporarily in Colab and then moved into the mounted Drive folder. Temporary source files are removed after the Drive copy is verified.
+- True cloud-to-cloud transfer that bypasses Colab is deferred until a concrete source/transfer method justifies adding it.
 
 ## Collaboration model
 - GitHub is the shared source of truth for code, specifications, decisions, and history.
@@ -23,7 +21,7 @@ This decision intentionally favors a small, understandable, testable system over
 - Never overwrite another developer's work without inspecting the latest state first.
 - Do not claim a task is complete without verifying the actual result.
 - Secrets and credentials must never be committed to GitHub.
-- Current branch: `main`. Additional branches are optional and should only be introduced when they provide a concrete benefit.
+- Current branch: `main`.
 
 ## Runtime and storage
 - Telegram: user interface and input channel.
@@ -35,7 +33,7 @@ This decision intentionally favors a small, understandable, testable system over
 - Only the owner's Telegram account may use the bot.
 - Other Telegram users must be rejected.
 - The Telegram bot token is entered only during first-time setup and stored securely outside GitHub.
-- Google Drive authorization/mounting is performed during first-time setup. Normal daily startup must not request Google consent again when the Colab environment still has the valid authorization available.
+- Google Drive authorization/mounting is performed during first-time setup. Normal daily startup must not request Google consent again when the Colab environment still has valid authorization.
 - No Google Drive API credentials, refresh-token implementation, or Drive API service is required by the first version.
 - Credentials for `@File2url_rbot`, if any are required by the actual integration, must be stored securely outside GitHub.
 
@@ -43,10 +41,11 @@ This decision intentionally favors a small, understandable, testable system over
 - Ordinary transfers must not require structured commands.
 - The user may send a URL directly.
 - The user may send/forward a Telegram file or message from a channel, group, or private chat when Telegram makes that message available to the bot.
-- The bot must not expose Telegram's public Bot API download limit as a user-facing failure such as "file larger than 20 MB".
-- When a forwarded Telegram file is too large for the bot's normal file-download path, the bot should automatically hand the message to `@File2url_rbot`, wait for a usable URL, and continue the same transfer workflow using that URL.
-- The user should not need to manually send the large file to `@File2url_rbot`.
-- Telegram file handling must not require a Local Bot API Server, MTProto/Telethon, `api_id`, or `api_hash` merely for this workflow.
+- The bot must not expose Telegram's normal Bot API download limit as a user-facing failure.
+- For a file that exceeds the normal Bot API download path, the bot may forward the original message to `@File2url_rbot`, wait for a usable URL, and continue the same transfer workflow using that URL.
+- This Bot-to-Bot path depends on Telegram's Bot-to-Bot Communication Mode being enabled for both participating bots in private chats. The integration must be tested with the actual `@File2url_rbot` service before it is considered production-ready.
+- The user should not need to manually send the large file to `@File2url_rbot` when the automatic path is working.
+- No Local Bot API Server, MTProto/Telethon, `api_id`, or `api_hash` is required merely for this workflow.
 
 ## Input and source handling
 - Accept direct URLs and supported Telegram-originating files/messages.
@@ -68,22 +67,24 @@ Rules:
 - Drive completion must be verified before the operation is marked successful.
 - Temporary files are deleted only after successful verification.
 - Failed or interrupted operations must not be reported as successful.
-- True cloud-to-cloud transfer is deferred; adding Google Drive API is not justified merely to claim a direct path that has not been validated.
+- URL and Telegram downloads use bounded retries with exponential backoff for transient request failures.
+- Cancellation is checked while streaming downloaded data.
+- Interrupted jobs retain their temporary path in persistent state when available, allowing startup recovery to resume from an existing temporary file instead of automatically starting from zero.
 
 ## Google Drive behavior
 - Exactly one active destination folder is used.
 - The destination folder can be changed through settings.
 - Original file formats are preserved whenever possible.
-- ZIP/RAR archives may be extracted into Drive while preserving their internal hierarchy; the archive itself is not retained as the primary result unless explicitly required.
+- ZIP/RAR archive extraction remains a later enhancement unless explicitly enabled in implementation.
 - Temporary Colab files are deleted after verified Drive storage.
-- Verification must use the actual file present in the mounted Drive destination, not merely the absence of an error during copying.
+- Verification checks the actual file present in the mounted Drive destination.
 
 ## Duplicate handling
 - Avoid duplicates using reliable available identity information rather than filename alone whenever practical.
-- Telegram-originating content should use available Telegram message/file identifiers as early identity signals.
-- External URLs should use normalized URL and available source metadata where useful.
-- When a stronger content check is necessary during temporary transfer, calculate SHA-256 while reading the file rather than performing an unnecessary second full read.
-- Do not download a complete file solely to calculate a hash when a safe earlier duplicate decision is available.
+- Telegram-originating content stores Telegram identifiers as early identity signals.
+- External URLs retain their source URL for recovery and future identity improvements.
+- SHA-256 is used as the authoritative content identity when a content check is required.
+- Existing destination files with the same filename are compared by size and SHA-256 before a numbered filename is created.
 - If the same content is already known to exist, reply simply: `الملف موجود مسبقاً`.
 - Do not expose the existing file link in the duplicate response.
 
@@ -93,26 +94,25 @@ Rules:
 - Provide a clean progress display.
 - Long operations should provide meaningful progress and a completion notification.
 - The user can cancel the current operation.
-- Transient failures should be retried automatically with bounded retries and backoff.
-- Interrupted work should be recoverable where practical.
-- Progress should distinguish source preparation, transfer, verification, and cleanup without exposing unnecessary implementation details.
+- Transient failures are retried automatically with bounded retries and backoff.
+- Interrupted work is recovered from persistent state where practical.
+- Progress distinguishes source preparation, transfer, verification, and cleanup without exposing unnecessary implementation details.
 
 ## Recovery and persistent state
 - Colab's local filesystem is not durable across runtime loss.
-- Operational state must be persisted in a way that survives Colab restarts.
-- For the first version, persistent state may be stored in a small database/state file inside a dedicated project folder on the mounted Google Drive, because this avoids introducing another external database or Drive API.
-- The state design must record queued jobs, active operation, completion status, retry information, source information, transfer method, and recovery information needed to avoid unsafe duplicate work.
-- On startup, restore the latest valid state, inspect unfinished operations, and recover them safely.
-- If Colab stops during an operation, that operation must not be marked complete.
-- If temporary data remains after interruption, startup recovery must determine whether it can be resumed or safely removed.
+- Operational state is persisted in a small state file inside the configured mounted Google Drive destination.
+- The state records queued jobs, status, source information, transfer method, retry/recovery information, and temporary paths when available.
+- On startup, unfinished jobs are restored to the queue.
+- If a valid temporary file from an interrupted job still exists, recovery reuses it instead of blindly downloading the source again.
+- If a temporary file is unavailable, the job can be retried from its retained source information.
+- If Colab stops during an operation, that operation is never marked complete merely because it was running.
 - If Colab is offline, the bot cannot process new requests.
 
 ## Validation and safety
 - Verify that the expected file exists in the mounted Drive destination and that its basic metadata is consistent before reporting success.
 - Detect obvious invalid source responses such as HTML error pages returned instead of the requested file.
-- Archive extraction must include reasonable path/traversal and unsafe-archive protections without unnecessary complexity.
-- Advanced integrity verification is deferred except where required for duplicate prevention and safe transfer.
-- Temporary files must be cleaned only after the durable Drive result has been verified.
+- Temporary files are cleaned only after the durable Drive result has been verified.
+- Advanced archive extraction and advanced integrity verification remain outside the minimal transfer path.
 
 ## Settings and history
 Settings should cover only useful operational controls, such as:
@@ -140,13 +140,13 @@ That startup cell should:
 
 It must not normally ask for the Telegram token again or repeat Google Drive authorization.
 
-If Google authorization has genuinely been revoked or is unavailable, the system should clearly identify the required first-time/recovery setup instead of pretending that Drive is available.
+If Google authorization has genuinely been revoked or is unavailable, the system should clearly identify the required recovery setup instead of pretending that Drive is available.
 
 ## Explicitly deferred
 - Google Drive API.
 - True cloud-to-cloud transfer bypassing Colab.
 - Gemini/AI integration.
-- Advanced integrity verification.
+- Advanced integrity verification beyond the content checks needed for safe duplicate handling.
 - Drive file-management features beyond what the uploader requires.
 - CI/CD and GitHub Actions unless later justified.
 - ChatGPT↔Colab/MCP direct integration.
@@ -159,8 +159,8 @@ If Google authorization has genuinely been revoked or is unavailable, the system
 Start with the smallest reliable system that satisfies the current requirements. Do not introduce services or infrastructure merely because they could be useful later. Every implementation step must preserve the agreed behavior and update this specification when a decision changes.
 
 ## First implementation target
-Build the minimal working end-to-end flow first:
+Build and validate the minimal end-to-end flow first:
 
 **Telegram owner → receive URL/file → obtain source → temporary Colab file when needed → move to the single mounted Drive folder → verify → delete temporary data → report result.**
 
-Only after this basic flow is working should queueing, recovery refinements, duplicate detection, archive extraction, quality selection, and other enhancements be layered in.
+Only after this basic flow is working should archive extraction, quality selection, advanced identity detection, and other enhancements be layered in.
