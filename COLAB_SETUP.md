@@ -19,9 +19,11 @@ The bot stores its persistent state under the configured Drive destination in `.
 
 ## Large Telegram files
 
-The current implementation uses Telegram's Bot-to-Bot Communication capability to forward a large incoming message to `FILE2URL_BOT_USERNAME` and waits for a URL response. Telegram requires Bot-to-Bot Communication Mode to be enabled for both participating bots for private bot-to-bot communication. This must be enabled/configured in BotFather before this path can work.
+Telegram now supports Bot-to-Bot Communication. In private chats, both the sending and receiving bots must have Bot-to-Bot Communication Mode enabled in @BotFather. The current implementation forwards the original large-file message to `FILE2URL_BOT_USERNAME` and waits for a URL reply from that bot. Telegram documents this capability and the requirement explicitly.
 
-If that capability is unavailable, the large-file path fails clearly; it does not silently pretend the file was stored.
+The actual `@File2url_rbot` integration must still be tested end-to-end because Telegram's capability only establishes bot-to-bot messaging; it does not guarantee that a particular third-party bot accepts the forwarded message and returns a usable URL.
+
+If the third-party bot does not respond with a usable URL, the operation fails clearly and is never reported as completed.
 
 ## Current v1 scope
 
