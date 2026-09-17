@@ -117,6 +117,10 @@ def download_url(url: str, temp_root: str, cancel_event=None, max_retries: int =
     raise TransferError(str(last_error or "تعذر تنزيل الملف."))
 
 
+def _job_by_id(state_store, job_id):
+    return next((job for job in state_store.data.get("jobs", []) if job.get("id") == job_id), None)
+
+
 def finalize_to_drive(
     temp_path: str,
     filename: str,
@@ -144,6 +148,9 @@ def finalize_to_drive(
         return result
 
     target = os.path.join(destination, safe_filename(filename))
+    job = _job_by_id(state_store, job_id) or {}
+    recovering_target = job.get("filename") == os.path.basename(target)
+
     if os.path.exists(target):
         try:
             existing_hash, existing_size = hash_file(target)
@@ -163,11 +170,18 @@ def finalize_to_drive(
                 return result
         except OSError:
             pass
-        stem, ext = os.path.splitext(target)
-        counter = 1
-        while os.path.exists(target):
-            target = f"{stem} ({counter}){ext}"
-            counter += 1
+
+        if recovering_target:
+            try:
+                os.remove(target)
+            except OSError as exc:
+                raise TransferError("تعذر تنظيف النسخة غير المكتملة من محاولة سابقة.") from exc
+        else:
+            stem, ext = os.path.splitext(target)
+            counter = 1
+            while os.path.exists(target):
+                target = f"{stem} ({counter}){ext}"
+                counter += 1
 
     state_store.update_job(
         job_id,
