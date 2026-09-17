@@ -247,7 +247,13 @@ class TelegramDriveBot:
 
     def restore_unfinished(self):
         for job in self.state.unfinished_jobs():
-            self.state.update_job(job["id"], status="queued", recovery_at=now())
+            previous_status = job.get("status")
+            self.state.update_job(
+                job["id"],
+                status="queued",
+                recovery_at=now(),
+                recovery_from_status=previous_status,
+            )
             self.queue.put_nowait(job)
 
     @staticmethod
