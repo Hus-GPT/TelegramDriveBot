@@ -9,7 +9,7 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes, Messag
 
 from .config import Config
 from .state import now
-from .transfer import TransferError, download_url, finalize_to_drive, safe_filename
+from .transfer import TransferCancelled, TransferError, download_url, finalize_to_drive, safe_filename
 
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
 
@@ -110,6 +110,12 @@ class TelegramDriveBot:
             self.active_cancel = asyncio.Event()
             try:
                 await self.process_job(application, job)
+            except TransferCancelled as exc:
+                self.state.update_job(job["id"], status="cancelled", error=str(exc))
+                try:
+                    await application.bot.send_message(job["chat_id"], "🛑 تم إلغاء العملية.")
+                except Exception:
+                    pass
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -127,28 +133,44 @@ class TelegramDriveBot:
         job_id = job["id"]
         self.state.update_job(job_id, status="running")
         status_message = await application.bot.send_message(chat_id, "⏳ جاري تجهيز الملف…")
-        temp_path = None
+        temp_path = job.get("temp_path") if job.get("temp_path") and os.path.isfile(job["temp_path"]) else None
         try:
+            self.ensure_not_cancelled()
             await application.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
-            source = job.get("source")
-            if source == "url" or (source == "telegram_via_file2url" and job.get("url")):
-                await self.update_status(status_message, "⬇️ جاري تنزيل المصدر…")
-                temp_path, filename = await asyncio.to_thread(
-                    download_url, job["url"], self.config.temp_root
-                )
+            if temp_path:
+                filename = safe_filename(job.get("filename") or os.path.basename(temp_path))
+                await self.update_status(status_message, "🔄 جاري استكمال الملف المؤقت…")
             else:
-                size = job.get("telegram_file_size")
-                if size and size > 20 * 1024 * 1024:
-                    await self.update_status(status_message, "🔗 الملف كبير؛ جاري تمريره لمسار الرابط…")
-                    url = await self.request_file_url(application, job)
-                    job["source"] = "telegram_via_file2url"
-                    self.state.update_job(job_id, source=job["source"], url=url)
+                source = job.get("source")
+                if source == "url" or (source == "telegram_via_file2url" and job.get("url")):
+                    await self.update_status(status_message, "⬇️ جاري تنزيل المصدر…")
                     temp_path, filename = await asyncio.to_thread(
-                        download_url, url, self.config.temp_root
+                        download_url,
+                        job["url"],
+                        self.config.temp_root,
+                        self.active_cancel,
+                        self.config.max_retries,
                     )
                 else:
-                    await self.update_status(status_message, "⬇️ جاري الحصول على الملف من Telegram…")
-                    temp_path, filename = await self.download_telegram_media(application, job)
+                    size = job.get("telegram_file_size")
+                    if size and size > 20 * 1024 * 1024:
+                        await self.update_status(status_message, "🔗 الملف كبير؛ جاري تمريره لمسار الرابط…")
+                        url = await self.request_file_url(application, job)
+                        self.ensure_not_cancelled()
+                        job["source"] = "telegram_via_file2url"
+                        self.state.update_job(job_id, source=job["source"], url=url)
+                        temp_path, filename = await asyncio.to_thread(
+                            download_url,
+                            url,
+                            self.config.temp_root,
+                            self.active_cancel,
+                            self.config.max_retries,
+                        )
+                    else:
+                        await self.update_status(status_message, "⬇️ جاري الحصول على الملف من Telegram…")
+                        temp_path, filename = await self.download_telegram_media(application, job)
+
+                self.state.update_job(job_id, temp_path=temp_path, filename=filename)
 
             self.ensure_not_cancelled()
             await self.update_status(status_message, "☁️ جاري حفظ الملف في Google Drive…")
@@ -170,19 +192,31 @@ class TelegramDriveBot:
                     f"✅ تم الحفظ بنجاح\n📄 {result['filename']}\n📦 {result['size']:,} بايت",
                 )
         except Exception:
-            # Failed temporary data is deliberately retained for later recovery/inspection.
+            if temp_path:
+                self.state.update_job(job_id, temp_path=temp_path)
             raise
 
     async def download_telegram_media(self, application: Application, job: dict):
-        os.makedirs(self.config.temp_root, exist_ok=True)
+        self.ensure_not_cancelled()
         file_id = job["telegram_file_id"]
         tg_file = await application.bot.get_file(file_id)
+        file_path = tg_file.file_path
+        if not file_path:
+            raise TransferError("لم يُرجع Telegram مسار الملف.")
+        url = f"https://api.telegram.org/file/bot{self.config.telegram_token}/{file_path}"
         filename = safe_filename(job.get("filename") or f"telegram_{job['message_id']}")
-        path = os.path.join(self.config.temp_root, f"{job['id']}_{filename}")
-        await tg_file.download_to_drive(path)
-        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        path, _ = await asyncio.to_thread(
+            download_url,
+            url,
+            self.config.temp_root,
+            self.active_cancel,
+            self.config.max_retries,
+        )
+        final_path = os.path.join(self.config.temp_root, f"{job['id']}_{filename}")
+        os.replace(path, final_path)
+        if not os.path.isfile(final_path) or os.path.getsize(final_path) == 0:
             raise TransferError("تعذر الحصول على الملف من Telegram.")
-        return path, filename
+        return final_path, filename
 
     async def request_file_url(self, application: Application, job: dict) -> str:
         if not self.file2url_username:
@@ -203,11 +237,11 @@ class TelegramDriveBot:
 
     def ensure_not_cancelled(self):
         if self.active_cancel and self.active_cancel.is_set():
-            raise TransferError("تم إلغاء العملية.")
+            raise TransferCancelled("تم إلغاء العملية.")
 
     def restore_unfinished(self):
         for job in self.state.unfinished_jobs():
-            self.state.update_job(job["id"], status="queued")
+            self.state.update_job(job["id"], status="queued", recovery_at=now())
             self.queue.put_nowait(job)
 
     @staticmethod
@@ -245,7 +279,6 @@ class TelegramDriveBot:
             .post_init(self.post_init)
             .build()
         )
-        # Bot-to-bot responses are intentionally inspected before normal user handlers.
         application.add_handler(MessageHandler(filters.ALL, self.bot_message), group=-2)
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.enqueue))
         application.add_handler(MessageHandler(filters.ATTACHMENT, self.enqueue))
