@@ -1,19 +1,11 @@
 import asyncio
 import os
 import re
-import shutil
 import uuid
-from urllib.parse import urlparse
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 from .config import Config
 from .state import now
@@ -78,7 +70,9 @@ class TelegramDriveBot:
         }
         self.state.add_job(job)
         position = self.queue.qsize() + 1
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء العملية الحالية", callback_data="cancel_current")]])
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ إلغاء العملية الحالية", callback_data="cancel_current")]]
+        )
         await message.reply_text(
             f"📥 تمت إضافة الطلب إلى الطابور.\nالترتيب: {position}",
             reply_markup=keyboard,
@@ -137,7 +131,7 @@ class TelegramDriveBot:
         try:
             await application.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
             source = job.get("source")
-            if source == "url":
+            if source == "url" or (source == "telegram_via_file2url" and job.get("url")):
                 await self.update_status(status_message, "⬇️ جاري تنزيل المصدر…")
                 temp_path, filename = await asyncio.to_thread(
                     download_url, job["url"], self.config.temp_root
@@ -176,17 +170,11 @@ class TelegramDriveBot:
                     f"✅ تم الحفظ بنجاح\n📄 {result['filename']}\n📦 {result['size']:,} بايت",
                 )
         except Exception:
-            if temp_path and os.path.exists(temp_path):
-                # Keep failed temporary data for recovery; startup recovery can inspect it later.
-                pass
+            # Failed temporary data is deliberately retained for later recovery/inspection.
             raise
 
     async def download_telegram_media(self, application: Application, job: dict):
         os.makedirs(self.config.temp_root, exist_ok=True)
-        message = await application.bot.get_updates(timeout=0)  # harmless connectivity check
-        del message
-        # The message object is not persisted between updates, so retrieve it from Telegram is not
-        # possible through Bot API. The first implementation therefore stores the file_id and uses get_file.
         file_id = job["telegram_file_id"]
         tg_file = await application.bot.get_file(file_id)
         filename = safe_filename(job.get("filename") or f"telegram_{job['message_id']}")
@@ -217,6 +205,11 @@ class TelegramDriveBot:
         if self.active_cancel and self.active_cancel.is_set():
             raise TransferError("تم إلغاء العملية.")
 
+    def restore_unfinished(self):
+        for job in self.state.unfinished_jobs():
+            self.state.update_job(job["id"], status="queued")
+            self.queue.put_nowait(job)
+
     @staticmethod
     def extract_url(message):
         text = message.text or message.caption or ""
@@ -246,8 +239,14 @@ class TelegramDriveBot:
             pass
 
     def build_application(self):
-        application = Application.builder().token(self.config.telegram_token).build()
-        application.add_handler(MessageHandler(filters.ALL & filters.UpdateType.MESSAGE & filters.User(self.config.owner_id), self.bot_message), group=-2)
+        application = (
+            Application.builder()
+            .token(self.config.telegram_token)
+            .post_init(self.post_init)
+            .build()
+        )
+        # Bot-to-bot responses are intentionally inspected before normal user handlers.
+        application.add_handler(MessageHandler(filters.ALL, self.bot_message), group=-2)
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.enqueue))
         application.add_handler(MessageHandler(filters.ATTACHMENT, self.enqueue))
         application.add_handler(CallbackQueryHandler(self.callback))
@@ -256,4 +255,5 @@ class TelegramDriveBot:
         return application
 
     async def post_init(self, application: Application):
+        self.restore_unfinished()
         application.create_task(self.worker(application))
