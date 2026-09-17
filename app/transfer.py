@@ -1,7 +1,6 @@
 import hashlib
 import os
 import re
-import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -49,17 +48,12 @@ def known_hashes(state_store) -> set[str]:
 
 
 def _download_stream(response, path: str, cancel_event=None):
-    digest = hashlib.sha256()
-    size = 0
     with open(path, "wb") as out:
         for chunk in response.iter_content(chunk_size=1024 * 1024):
             if cancel_event is not None and cancel_event.is_set():
                 raise TransferCancelled("تم إلغاء العملية.")
             if chunk:
                 out.write(chunk)
-                digest.update(chunk)
-                size += len(chunk)
-    return digest.hexdigest(), size
 
 
 def download_url(url: str, temp_root: str, cancel_event=None, max_retries: int = 3) -> tuple[str, str]:
@@ -95,8 +89,8 @@ def download_url(url: str, temp_root: str, cancel_event=None, max_retries: int =
 
             fd, path = tempfile.mkstemp(prefix="tdb_", suffix="_" + name, dir=temp_root)
             os.close(fd)
-            sha256, size = _download_stream(response, path, cancel_event)
-            if size == 0:
+            _download_stream(response, path, cancel_event)
+            if os.path.getsize(path) == 0:
                 raise TransferError("الملف الناتج فارغ.")
             return path, name
         except TransferCancelled:
@@ -145,12 +139,12 @@ def finalize_to_drive(
             "job_id": job_id,
             "timestamp": now(),
         }
+        state_store.update_job(job_id, status="completed", sha256=sha256, size=size, temp_path=None)
         state_store.add_history(result)
         return result
 
     target = os.path.join(destination, safe_filename(filename))
     if os.path.exists(target):
-        existing_hash = None
         try:
             existing_hash, existing_size = hash_file(target)
             if existing_size == size and existing_hash == sha256:
@@ -164,6 +158,7 @@ def finalize_to_drive(
                     "job_id": job_id,
                     "timestamp": now(),
                 }
+                state_store.update_job(job_id, status="completed", filename=os.path.basename(target), sha256=sha256, size=size, temp_path=None)
                 state_store.add_history(result)
                 return result
         except OSError:
