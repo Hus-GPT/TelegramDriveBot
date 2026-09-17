@@ -229,10 +229,16 @@ class TelegramDriveBot:
                 from_chat_id=job["chat_id"],
                 message_id=job["message_id"],
             )
-            return await asyncio.wait_for(self.file2url_waiter, timeout=90)
-        except asyncio.TimeoutError:
-            raise TransferError("لم يصل رابط الملف الكبير من خدمة التحويل ضمن المهلة.")
+            while True:
+                if self.active_cancel and self.active_cancel.is_set():
+                    raise TransferCancelled("تم إلغاء العملية.")
+                try:
+                    return await asyncio.wait_for(asyncio.shield(self.file2url_waiter), timeout=1)
+                except asyncio.TimeoutError:
+                    continue
         finally:
+            if self.file2url_waiter and not self.file2url_waiter.done():
+                self.file2url_waiter.cancel()
             self.file2url_waiter = None
 
     def ensure_not_cancelled(self):
