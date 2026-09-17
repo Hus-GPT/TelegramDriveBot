@@ -149,7 +149,10 @@ def finalize_to_drive(
 
     target = os.path.join(destination, safe_filename(filename))
     job = _job_by_id(state_store, job_id) or {}
-    recovering_target = bool(job.get("recovery_at")) and job.get("filename") == os.path.basename(target)
+    recovering_target = (
+        job.get("recovery_from_status") == "verifying"
+        and job.get("filename") == os.path.basename(target)
+    )
 
     if os.path.exists(target):
         try:
