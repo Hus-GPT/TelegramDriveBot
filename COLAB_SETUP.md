@@ -1,34 +1,43 @@
-# Colab setup
+# TelegramDriveBot Setup on Google Colab
 
-## First-time setup
+This guide describes how to run TelegramDriveBot inside a Google Colab notebook session.
 
-1. Open a new Google Colab notebook.
-2. Add these values to Colab Secrets (do not put them in GitHub):
-   - `TELEGRAM_BOT_TOKEN`
-   - `OWNER_TELEGRAM_ID`
-   - `DRIVE_DESTINATION` (optional; default: `/content/drive/MyDrive/TelegramDriveBot`)
-   - `FILE2URL_BOT_USERNAME` (optional; default: `@File2url_rbot`)
-3. The first run mounts Google Drive and may ask for Google authorization.
-4. Install the requirements and start the bot from the repository.
+## One-Cell Startup
 
-## Normal startup
+Paste and run the following command in a single Colab cell:
 
-The intended daily workflow is one Colab cell that updates the repository, installs the pinned dependencies, and runs `app.colab_start`.
+```python
+import os
+from google.colab import drive
 
-The bot stores its persistent state under the configured Drive destination in `.telegramdrive_state.json`.
+# 1. Mount Google Drive
+drive.mount('/content/drive')
 
-## Large Telegram files
+# 2. Clone repository if not present
+if not os.path.exists('/content/TelegramDriveBot'):
+    !git clone https://github.com/Hus-GPT/TelegramDriveBot.git /content/TelegramDriveBot
 
-Telegram now supports Bot-to-Bot Communication. In private chats, both the sending and receiving bots must have Bot-to-Bot Communication Mode enabled in @BotFather. The current implementation forwards the original large-file message to `FILE2URL_BOT_USERNAME` and waits for a URL reply from that bot. Telegram documents this capability and the requirement explicitly.
+%cd /content/TelegramDriveBot
+!pip install -r requirements.txt
 
-The actual `@File2url_rbot` integration must still be tested end-to-end because Telegram's capability only establishes bot-to-bot messaging; it does not guarantee that a particular third-party bot accepts the forwarded message and returns a usable URL.
+# 3. Launch Bot
+!python -m app.colab_start
+```
 
-If the third-party bot does not respond with a usable URL, the operation fails clearly and is never reported as completed.
+## Secrets Configuration
 
-## Current v1 scope
+In the left sidebar of Google Colab, open **Secrets** (key icon) and set:
 
-Implemented first path:
+* `TELEGRAM_BOT_TOKEN`: The API token from `@BotFather`.
+* `OWNER_ID`: Your numerical Telegram user ID (from `@userinfobot`).
 
-`Telegram/URL -> temporary Colab -> mounted Google Drive -> verification -> cleanup`
+## How Persistence & Recovery Work
 
-The project deliberately does not use Google Drive API.
+* **State Storage:** Saved directly to your Google Drive at:
+  `/content/drive/MyDrive/TelegramDriveBot/.state/state.json`
+* **Colab Disconnects:**
+  * When a session disconnects, files in `/tmp` disappear with the Colab VM.
+  * On restart, `restore_unfinished()` cleans up leftover `.part_<job_id>_*` files on Drive, preserves intact staging files if Colab storage survived, and resets interrupted downloads safely to `queued`.
+* **File2URL Forwarding:**
+  * Telegram restricts Bot API downloads to 20MB. Media over 20MB is forwarded to `@File2url_rbot`.
+  * The single-worker engine waits up to 120s for the external response. If the external bot fails or times out, the job fails cleanly without stalling subsequent transfers.

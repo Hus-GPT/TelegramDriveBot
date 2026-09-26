@@ -25,16 +25,21 @@ VALID_STATES = {
     "cancelled",
 }
 
-# Legal forward transitions
+# Strict forward legal transitions
 LEGAL_TRANSITIONS = {
     "queued": {"downloading", "cancelled", "failed"},
     "downloading": {"downloaded", "failed", "cancelled"},
     "downloaded": {"verifying", "failed", "cancelled"},
     "verifying": {"completed", "failed", "cancelled"},
     "completed": set(),
-    "failed": {"queued"},       # for manual retry
-    "cancelled": {"queued"},    # for manual retry
+    "failed": set(),       # only transitions out via retry_job / recover_job
+    "cancelled": set(),    # only transitions out via retry_job / recover_job
 }
+
+
+class InvalidStateTransitionError(ValueError):
+    """Raised when an illegal state machine transition is attempted."""
+    pass
 
 
 def now_utc_iso() -> str:
@@ -62,6 +67,15 @@ class StateStore:
         }
         self._load()
 
+    def _recalculate_stats(self) -> None:
+        """Calculate stats reflecting the count of jobs CURRENTLY in terminal states."""
+        counts = {"completed": 0, "failed": 0, "cancelled": 0}
+        for job in self.data.get("jobs", []):
+            st = job.get("status")
+            if st in counts:
+                counts[st] += 1
+        self.data["stats"] = counts
+
     def _load(self) -> None:
         """Load state safely, handling missing or malformed state files."""
         with self._lock:
@@ -81,10 +95,9 @@ class StateStore:
                     raw = json.load(f)
                 if isinstance(raw, dict) and "jobs" in raw and isinstance(raw["jobs"], list):
                     self.data = raw
-                    if "stats" not in self.data or not isinstance(self.data["stats"], dict):
-                        self.data["stats"] = {"completed": 0, "failed": 0, "cancelled": 0}
                     if "version" not in self.data:
                         self.data["version"] = 2
+                    self._recalculate_stats()
                 else:
                     logger.warning("Malformed state file at %s (invalid schema). Creating backup.", self.state_path)
                     self._create_corrupt_backup()
@@ -114,11 +127,12 @@ class StateStore:
         if len(jobs) > self.max_history:
             terminal_jobs = [j for j in jobs if j.get("status") in {"completed", "failed", "cancelled"}]
             active_jobs = [j for j in jobs if j.get("status") not in {"completed", "failed", "cancelled"}]
-            # Keep all active jobs + newest terminal jobs
             excess = len(jobs) - self.max_history
             if excess > 0 and terminal_jobs:
                 pruned_terminal = terminal_jobs[excess:]
                 self.data["jobs"] = active_jobs + pruned_terminal
+
+        self._recalculate_stats()
 
         tmp_fd, tmp_path = tempfile.mkstemp(dir=state_dir, prefix="state_", suffix=".tmp")
         try:
@@ -142,6 +156,7 @@ class StateStore:
         user_id: int,
         source_url: Optional[str] = None,
         telegram_file_id: Optional[str] = None,
+        telegram_message_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         with self._lock:
             job = {
@@ -149,6 +164,7 @@ class StateStore:
                 "source_type": source_type,
                 "source_url": source_url,
                 "telegram_file_id": telegram_file_id,
+                "telegram_message_id": telegram_message_id,
                 "filename": filename,
                 "chat_id": chat_id,
                 "user_id": user_id,
@@ -169,23 +185,56 @@ class StateStore:
             return dict(job)
 
     def update_job(self, job_id: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        """Strictly updates job with legal state transition enforcement."""
         with self._lock:
             for job in self.data.get("jobs", []):
                 if job.get("id") == str(job_id):
                     new_status = kwargs.get("status")
                     if new_status and new_status != job.get("status"):
                         if new_status not in VALID_STATES:
-                            logger.warning("Attempted invalid state transition to %s for job %s", new_status, job_id)
+                            raise InvalidStateTransitionError(f"حالة غير صالحة: {new_status}")
                         old_status = job.get("status")
-                        # Validate transition if not an explicit reset/recovery
-                        if "recovery_from_status" not in kwargs and new_status not in LEGAL_TRANSITIONS.get(old_status, set()):
-                            logger.warning("Unorthodox state transition from %s to %s for job %s", old_status, new_status, job_id)
+                        if new_status not in LEGAL_TRANSITIONS.get(old_status, set()):
+                            raise InvalidStateTransitionError(
+                                f"انتقال حالة غير مسموح به برمجياً من '{old_status}' إلى '{new_status}' للمهمة {job_id}"
+                            )
 
-                        # Update stats on transition into terminal states
-                        if new_status in {"completed", "failed", "cancelled"}:
-                            stats = self.data.setdefault("stats", {"completed": 0, "failed": 0, "cancelled": 0})
-                            stats[new_status] = stats.get(new_status, 0) + 1
+                    job.update(kwargs)
+                    job["updated_at"] = now_utc_iso()
+                    self._save()
+                    return dict(job)
+            return None
 
+    def retry_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Controlled path to transition a failed or cancelled job back to queued."""
+        with self._lock:
+            for job in self.data.get("jobs", []):
+                if job.get("id") == str(job_id):
+                    current_status = job.get("status")
+                    if current_status not in {"failed", "cancelled"}:
+                        raise InvalidStateTransitionError(
+                            f"لا يمكن إعادة تشغيل المهمة {job_id} لأنها في حالة: {current_status}"
+                        )
+                    job["status"] = "queued"
+                    job["error"] = None
+                    job["retries"] = 0
+                    job["recovery_from_status"] = current_status
+                    job["updated_at"] = now_utc_iso()
+                    self._save()
+                    return dict(job)
+            return None
+
+    def recover_job(self, job_id: str, target_status: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        """Controlled path for startup crash recovery only."""
+        with self._lock:
+            for job in self.data.get("jobs", []):
+                if job.get("id") == str(job_id):
+                    if target_status not in VALID_STATES:
+                        raise InvalidStateTransitionError(f"حالة استعادة غير صالحة: {target_status}")
+                    current_status = job.get("status")
+                    job["recovery_from_status"] = current_status
+                    job["recovery_at"] = now_utc_iso()
+                    job["status"] = target_status
                     job.update(kwargs)
                     job["updated_at"] = now_utc_iso()
                     self._save()

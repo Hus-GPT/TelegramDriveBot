@@ -1,23 +1,29 @@
-"""Automated test suite for TelegramDriveBot Core Reliability."""
+"""Comprehensive automated test suite for TelegramDriveBot Core Reliability."""
 
+import asyncio
 import hashlib
 import json
 import os
 import tempfile
 import threading
 import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.state import StateStore, now_utc_iso
+from app.config import Config
+from app.state import InvalidStateTransitionError, StateStore, now_utc_iso
 from app.transfer import (
     FinalizeResult,
     NonRetryableTransferError,
     RetryableTransferError,
+    clean_orphan_drive_partials,
+    download_url,
     extract_filename_from_url,
     finalize_to_drive,
     hash_file,
     parse_content_disposition,
     safe_filename,
 )
+from app.bot import File2URLProvider, TelegramDriveBotApp
 
 
 @pytest.fixture
@@ -26,21 +32,109 @@ def temp_dirs():
         yield staging, drive
 
 
-class DummyStateStore:
-    def __init__(self):
-        self.data = {"jobs": []}
+# ---------------------------------------------------------
+# 1. State Machine & Transition Tests
+# ---------------------------------------------------------
 
-    def update_job(self, job_id, **kwargs):
-        for j in self.data["jobs"]:
-            if j["id"] == job_id:
-                j.update(kwargs)
-                return j
-        j = {"id": job_id, **kwargs}
-        self.data["jobs"].append(j)
-        return j
+def test_state_store_legal_transitions(temp_dirs):
+    _, drive = temp_dirs
+    state_file = os.path.join(drive, "state.json")
+    store = StateStore(state_file)
+
+    job = store.add_job("j1", "direct_url", "f.bin", 1, 2)
+    assert job["status"] == "queued"
+
+    # queued -> downloading
+    j1 = store.update_job("j1", status="downloading")
+    assert j1["status"] == "downloading"
+
+    # downloading -> downloaded
+    j2 = store.update_job("j1", status="downloaded")
+    assert j2["status"] == "downloaded"
+
+    # downloaded -> verifying
+    j3 = store.update_job("j1", status="verifying")
+    assert j3["status"] == "verifying"
+
+    # verifying -> completed
+    j4 = store.update_job("j1", status="completed")
+    assert j4["status"] == "completed"
 
 
-# 1. safe_filename tests
+def test_state_store_illegal_transitions(temp_dirs):
+    _, drive = temp_dirs
+    state_file = os.path.join(drive, "state.json")
+    store = StateStore(state_file)
+
+    store.add_job("j_illegal", "direct_url", "f.bin", 1, 2)
+
+    # queued -> completed (illegal)
+    with pytest.raises(InvalidStateTransitionError):
+        store.update_job("j_illegal", status="completed")
+
+    # queued -> downloading
+    store.update_job("j_illegal", status="downloading")
+
+    # downloading -> completed (illegal)
+    with pytest.raises(InvalidStateTransitionError):
+        store.update_job("j_illegal", status="completed")
+
+
+def test_state_store_retry_and_recovery(temp_dirs):
+    _, drive = temp_dirs
+    state_file = os.path.join(drive, "state.json")
+    store = StateStore(state_file)
+
+    store.add_job("j_retry", "direct_url", "f.bin", 1, 2)
+    store.update_job("j_retry", status="failed")
+
+    # Direct illegal transition failed -> downloading must fail
+    with pytest.raises(InvalidStateTransitionError):
+        store.update_job("j_retry", status="downloading")
+
+    # Controlled retry_job succeeds
+    retried = store.retry_job("j_retry")
+    assert retried["status"] == "queued"
+    assert retried["recovery_from_status"] == "failed"
+
+    # Controlled recover_job succeeds
+    store.update_job("j_retry", status="downloading")
+    recovered = store.recover_job("j_retry", "queued")
+    assert recovered["status"] == "queued"
+    assert recovered["recovery_from_status"] == "downloading"
+
+
+# ---------------------------------------------------------
+# 2. Terminal State & Statistics Semantics Tests
+# ---------------------------------------------------------
+
+def test_terminal_state_statistics(temp_dirs):
+    _, drive = temp_dirs
+    state_file = os.path.join(drive, "state.json")
+    store = StateStore(state_file)
+
+    store.add_job("j1", "direct_url", "f1.bin", 1, 2)
+    store.update_job("j1", status="failed")
+    assert store.data["stats"]["failed"] == 1
+
+    # Retry job -> failed count must decrease to 0
+    store.retry_job("j1")
+    assert store.data["stats"]["failed"] == 0
+
+    # Fail it again -> failed count is 1, not 2!
+    store.update_job("j1", status="failed")
+    assert store.data["stats"]["failed"] == 1
+
+    # Reload from disk and verify recalculated stats
+    reloaded = StateStore(state_file)
+    assert reloaded.data["stats"]["failed"] == 1
+    assert reloaded.data["stats"]["completed"] == 0
+
+
+# ---------------------------------------------------------
+# 3. Filename, Content Disposition, and Hashing
+# ---------------------------------------------------------
+
 def test_safe_filename():
     assert safe_filename("normal.pdf") == "normal.pdf"
     assert safe_filename("../../etc/passwd") == "passwd"
@@ -50,14 +144,12 @@ def test_safe_filename():
     assert safe_filename("bad:name*<>.txt") == "bad_name___.txt"
 
 
-# 2. Content disposition parser
 def test_parse_content_disposition():
     assert parse_content_disposition('attachment; filename="report.pdf"') == "report.pdf"
     assert parse_content_disposition("attachment; filename*=UTF-8''my%20file.zip") == "my file.zip"
     assert parse_content_disposition("") is None
 
 
-# 3. Hash file
 def test_hash_file_and_empty(temp_dirs):
     staging, _ = temp_dirs
     filepath = os.path.join(staging, "sample.txt")
@@ -65,8 +157,7 @@ def test_hash_file_and_empty(temp_dirs):
         f.write(b"Hello TelegramDriveBot!")
 
     sha, size = hash_file(filepath)
-    expected_sha = hashlib.sha256(b"Hello TelegramDriveBot!").hexdigest()
-    assert sha == expected_sha
+    assert sha == hashlib.sha256(b"Hello TelegramDriveBot!").hexdigest()
     assert size == len(b"Hello TelegramDriveBot!")
 
     empty_path = os.path.join(staging, "empty.bin")
@@ -77,15 +168,22 @@ def test_hash_file_and_empty(temp_dirs):
     assert e_sha == hashlib.sha256(b"").hexdigest()
 
 
-# 4. Finalize to Drive - Successful copy and verification
+# ---------------------------------------------------------
+# 4. Finalize to Drive, Duplicates, and Collisions
+# ---------------------------------------------------------
+
 def test_finalize_to_drive_success(temp_dirs):
     staging, drive = temp_dirs
     src = os.path.join(staging, "src.dat")
     with open(src, "wb") as f:
         f.write(b"Reliable core payload")
 
-    store = DummyStateStore()
-    res = finalize_to_drive(src, "data.bin", drive, store, "job1")
+    store = StateStore(os.path.join(drive, "state.json"))
+    store.add_job("j_fin", "direct_url", "data.bin", 1, 2)
+    store.update_job("j_fin", status="downloading")
+    store.update_job("j_fin", status="downloaded")
+
+    res = finalize_to_drive(src, "data.bin", drive, store, "j_fin")
 
     assert res.action == "copied"
     assert not res.is_duplicate
@@ -95,31 +193,33 @@ def test_finalize_to_drive_success(temp_dirs):
     dest_sha, dest_size = hash_file(res.destination_path)
     assert dest_sha == res.sha256
     assert dest_size == res.size
+    assert store.get_job("j_fin")["status"] == "completed"
 
 
-# 5. Finalize to Drive - Duplicate content detection
 def test_finalize_duplicate_content(temp_dirs):
     staging, drive = temp_dirs
-    # Existing identical file in drive
     dest_existing = os.path.join(drive, "doc.pdf")
     with open(dest_existing, "wb") as f:
         f.write(b"Same exact bytes")
 
-    # Staged identical file
     src = os.path.join(staging, "doc_temp.pdf")
     with open(src, "wb") as f:
         f.write(b"Same exact bytes")
 
-    store = DummyStateStore()
-    res = finalize_to_drive(src, "doc.pdf", drive, store, "job_dup")
+    store = StateStore(os.path.join(drive, "state.json"))
+    store.add_job("j_dup", "direct_url", "doc.pdf", 1, 2)
+    store.update_job("j_dup", status="downloading")
+    store.update_job("j_dup", status="downloaded")
+
+    res = finalize_to_drive(src, "doc.pdf", drive, store, "j_dup")
 
     assert res.is_duplicate is True
     assert res.action == "duplicate_skipped"
     assert res.destination_path == dest_existing
     assert not os.path.exists(src)
+    assert store.get_job("j_dup")["status"] == "completed"
 
 
-# 6. Finalize to Drive - Collision avoidance (same name, different content)
 def test_finalize_filename_collision(temp_dirs):
     staging, drive = temp_dirs
     dest_existing = os.path.join(drive, "file.txt")
@@ -130,8 +230,12 @@ def test_finalize_filename_collision(temp_dirs):
     with open(src, "wb") as f:
         f.write(b"New different file version")
 
-    store = DummyStateStore()
-    res = finalize_to_drive(src, "file.txt", drive, store, "job_col")
+    store = StateStore(os.path.join(drive, "state.json"))
+    store.add_job("j_col", "direct_url", "file.txt", 1, 2)
+    store.update_job("j_col", status="downloading")
+    store.update_job("j_col", status="downloaded")
+
+    res = finalize_to_drive(src, "file.txt", drive, store, "j_col")
 
     assert res.action == "collision_renamed"
     assert res.destination_path == os.path.join(drive, "file (1).txt")
@@ -139,51 +243,176 @@ def test_finalize_filename_collision(temp_dirs):
     assert os.path.exists(res.destination_path)
 
 
-# 7. Finalize to Drive - Cancellation
-def test_finalize_cancellation(temp_dirs):
+# ---------------------------------------------------------
+# 5. Safe Orphan Drive Partial Cleanup
+# ---------------------------------------------------------
+
+def test_clean_orphan_drive_partials(temp_dirs):
+    _, drive = temp_dirs
+    store = StateStore(os.path.join(drive, "state.json"))
+
+    # Active job j_active
+    store.add_job("j_active", "direct_url", "active.bin", 1, 2)
+    part_active = os.path.join(drive, ".part_j_active_active.bin")
+    with open(part_active, "wb") as f:
+        f.write(b"in flight")
+
+    # Completed job j_done
+    store.add_job("j_done", "direct_url", "done.bin", 1, 2)
+    store.update_job("j_done", status="completed")
+    part_done = os.path.join(drive, ".part_j_done_done.bin")
+    with open(part_done, "wb") as f:
+        f.write(b"leftover")
+
+    # Unrelated user file starting with .part
+    unrelated = os.path.join(drive, ".part_notmatchingconvention")
+    with open(unrelated, "wb") as f:
+        f.write(b"do not touch")
+
+    cleaned = clean_orphan_drive_partials(drive, store)
+    assert part_done in cleaned
+    assert not os.path.exists(part_done)
+
+    # Active partial and unrelated must NOT be cleaned
+    assert os.path.exists(part_active)
+    assert os.path.exists(unrelated)
+
+
+# ---------------------------------------------------------
+# 6. File2URL Serialized Provider Tests
+# ---------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_file2url_success_and_cleanup():
+    provider = File2URLProvider("file2url_rbot", timeout=5)
+
+    fut = await provider.register_waiter("job_f1")
+    assert not fut.done()
+
+    # Incoming response
+    delivered = await provider.complete_waiter("https://cdn.example.com/file.mp4")
+    assert delivered is True
+    res = await fut
+    assert res == "https://cdn.example.com/file.mp4"
+
+    # Unsolicited response when no job waiting is safely dropped
+    dropped = await provider.complete_waiter("https://cdn.example.com/stale.mp4")
+    assert dropped is False
+
+
+@pytest.mark.asyncio
+async def test_file2url_cancellation():
+    provider = File2URLProvider("file2url_rbot", timeout=5)
+
+    fut = await provider.register_waiter("job_f2")
+    await provider.cancel_waiter("job_f2")
+    assert fut.cancelled()
+
+
+# ---------------------------------------------------------
+# 7. Queued Job Cancellation
+# ---------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_queued_job_cancellation_skips_worker(temp_dirs):
     staging, drive = temp_dirs
-    src = os.path.join(staging, "cancel.bin")
-    with open(src, "wb") as f:
-        f.write(b"content")
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=123456,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
 
-    cancel_evt = threading.Event()
-    cancel_evt.set()
+    # Add job to state and queue
+    job = app.state.add_job("j_cancel_q", "direct_url", "test.bin", 123456, 123456, source_url="http://mock.com/t.bin")
+    await app.queue.put(job)
 
-    store = DummyStateStore()
-    with pytest.raises(NonRetryableTransferError):
-        finalize_to_drive(src, "cancel.bin", drive, store, "job_c", cancel_event=cancel_evt)
+    # Simulate /cancel before worker gets it
+    app.state.update_job("j_cancel_q", status="cancelled")
+
+    # Run worker loop for 1 step
+    with patch.object(app, "process_job", new_callable=AsyncMock) as mock_process:
+        worker_task = asyncio.create_task(app.worker_loop())
+        await app.queue.join()
+        worker_task.cancel()
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
+
+        # Must NOT call process_job for cancelled queued job!
+        mock_process.assert_not_called()
+        assert app.state.get_job("j_cancel_q")["status"] == "cancelled"
 
 
-# 8. StateStore - Atomic writes and schema resilience
-def test_state_store_lifecycle(temp_dirs):
+# ---------------------------------------------------------
+# 8. Deterministic Recovery Tests
+# ---------------------------------------------------------
+
+def test_restore_unfinished_branches(temp_dirs):
+    staging, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=123456,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+
+    # Branch 1: downloading job -> reset to queued and clean local staging
+    part_stage = os.path.join(staging, "part1.bin")
+    with open(part_stage, "wb") as f:
+        f.write(b"broken")
+    app.state.add_job("j_dl", "direct_url", "f1.bin", 1, 2)
+    app.state.update_job("j_dl", status="downloading", temp_path=part_stage)
+
+    # Branch 2: downloaded job with valid temp_path -> preserved
+    valid_stage = os.path.join(staging, "valid.bin")
+    with open(valid_stage, "wb") as f:
+        f.write(b"intact content")
+    v_sha, v_size = hash_file(valid_stage)
+    app.state.add_job("j_valid", "direct_url", "valid.bin", 1, 2)
+    app.state.update_job("j_valid", status="downloading")
+    app.state.update_job("j_valid", status="downloaded", temp_path=valid_stage, sha256=v_sha, size=v_size)
+
+    # Branch 3: downloaded job with missing temp_path -> reset to queued
+    app.state.add_job("j_lost", "direct_url", "lost.bin", 1, 2)
+    app.state.update_job("j_lost", status="downloading")
+    app.state.update_job("j_lost", status="downloaded", temp_path=os.path.join(staging, "missing.bin"))
+
+    # Execute recovery
+    app.restore_unfinished()
+
+    assert not os.path.exists(part_stage)
+    assert app.state.get_job("j_dl")["status"] == "queued"
+
+    assert app.state.get_job("j_valid")["status"] == "downloaded"
+    assert os.path.exists(valid_stage)
+
+    assert app.state.get_job("j_lost")["status"] == "queued"
+
+
+# ---------------------------------------------------------
+# 9. Telegram Message ID Persistence
+# ---------------------------------------------------------
+
+def test_telegram_message_id_persisted(temp_dirs):
     _, drive = temp_dirs
-    state_file = os.path.join(drive, ".state", "state.json")
-    store = StateStore(state_file)
+    store = StateStore(os.path.join(drive, "state.json"))
 
-    job = store.add_job("j1", "direct_url", "test.bin", 1234, 5678, source_url="http://example.com/test.bin")
-    assert job["status"] == "queued"
+    job = store.add_job(
+        job_id="j_msg",
+        source_type="telegram_large",
+        filename="video.mp4",
+        chat_id=123,
+        user_id=456,
+        telegram_file_id="fid_123",
+        telegram_message_id=98765,
+    )
+    assert job["telegram_message_id"] == 98765
 
-    updated = store.update_job("j1", status="downloading")
-    assert updated["status"] == "downloading"
-
-    store.update_job("j1", status="completed")
-    retrieved = store.get_job("j1")
-    assert retrieved["status"] == "completed"
-    assert store.data["stats"]["completed"] == 1
-
-    # Reload store from disk
-    reloaded = StateStore(state_file)
-    assert reloaded.get_job("j1") is not None
-    assert reloaded.get_job("j1")["status"] == "completed"
-
-
-# 9. StateStore - Malformed state handling
-def test_state_store_malformed(temp_dirs):
-    _, drive = temp_dirs
-    state_file = os.path.join(drive, "bad_state.json")
-    with open(state_file, "w") as f:
-        f.write("{ invalid json")
-
-    store = StateStore(state_file)
-    assert store.data["jobs"] == []
-    assert os.path.exists(state_file)  # Restored valid JSON
+    reloaded = StateStore(os.path.join(drive, "state.json"))
+    assert reloaded.get_job("j_msg")["telegram_message_id"] == 98765

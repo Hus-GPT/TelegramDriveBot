@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import logging
 import os
@@ -10,7 +11,7 @@ import shutil
 import tempfile
 import urllib.parse
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 
@@ -125,11 +126,7 @@ def download_url(
     max_retries: int = 3,
     progress_callback: Optional[Callable[[int, Optional[int]], None]] = None,
 ) -> Tuple[str, str, int]:
-    """Stream download a direct URL into a temporary file safely.
-
-    Returns:
-        (temp_file_path, resolved_filename, byte_size)
-    """
+    """Stream download a direct URL into a temporary file safely."""
     os.makedirs(temp_root, exist_ok=True)
     last_error: Optional[Exception] = None
 
@@ -148,19 +145,16 @@ def download_url(
                 headers={"User-Agent": "TelegramDriveBot/2.0"},
             )
 
-            # Classify status code
             if response.status_code in {400, 401, 403, 404, 405, 410}:
                 raise NonRetryableTransferError(f"فشل التحميل (رمز HTTP غير قابل لإعادة المحاولة: {response.status_code})")
             if response.status_code >= 500:
                 raise RetryableTransferError(f"خطأ خادم مؤقت (HTTP {response.status_code})")
             response.raise_for_status()
 
-            # Reject HTML landing pages masquerading as file downloads
             content_type = response.headers.get("Content-Type", "").lower()
             if "text/html" in content_type and not (custom_filename and custom_filename.endswith(".html")):
                 raise NonRetryableTransferError("الرابط يشير إلى صفحة ويب (HTML) وليس إلى ملف تحميل مباشر.")
 
-            # Resolve filename
             cd_name = parse_content_disposition(response.headers.get("Content-Disposition", ""))
             resolved_filename = (
                 safe_filename(custom_filename)
@@ -168,7 +162,6 @@ def download_url(
                 else (cd_name or extract_filename_from_url(response.url or url))
             )
 
-            # Download streaming
             content_length_hdr = response.headers.get("Content-Length")
             total_expected = int(content_length_hdr) if content_length_hdr and content_length_hdr.isdigit() else None
 
@@ -219,13 +212,39 @@ def download_url(
     raise RetryableTransferError(f"تعذر تنزيل الملف بعد {max_retries} محاولات: {last_error}")
 
 
-def _find_job(state_store: Any, job_id: str) -> Optional[Dict[str, Any]]:
-    if not state_store or not hasattr(state_store, "data"):
-        return None
-    for j in state_store.data.get("jobs", []):
-        if j.get("id") == str(job_id):
-            return j
-    return None
+def clean_orphan_drive_partials(destination_dir: str, state_store: Any) -> List[str]:
+    """Safely removes only orphaned .part_<job_id>_* files from Google Drive destination.
+
+    A partial file is an orphan IF AND ONLY IF:
+    1. It matches the project-specific naming convention '.part_<job_id>_*'
+    2. The associated job does not exist in StateStore, OR the job is in a terminal state (completed, failed, cancelled).
+    Never touches any other user files.
+    """
+    cleaned: List[str] = []
+    if not os.path.exists(destination_dir):
+        return cleaned
+
+    pattern = os.path.join(destination_dir, ".part_*_*")
+    for part_path in glob.glob(pattern):
+        filename = os.path.basename(part_path)
+        # Extract job_id: format is .part_{job_id}_{orig_name}
+        match = re.match(r"^\.part_([^_]+)_(.+)$", filename)
+        if not match:
+            continue
+
+        job_id = match.group(1)
+        job = state_store.get_job(job_id) if hasattr(state_store, "get_job") else None
+
+        # Orphan if job does not exist or is in terminal state
+        if not job or job.get("status") in {"completed", "failed", "cancelled"}:
+            try:
+                os.remove(part_path)
+                cleaned.append(part_path)
+                logger.info("Cleaned orphan partial Drive file: %s", part_path)
+            except OSError as exc:
+                logger.warning("Failed cleaning orphan partial file %s: %s", part_path, exc)
+
+    return cleaned
 
 
 def finalize_to_drive(
@@ -236,23 +255,12 @@ def finalize_to_drive(
     job_id: str,
     cancel_event: Optional[Any] = None,
 ) -> FinalizeResult:
-    """Safely verify integrity, check duplicate/collision, and copy to Google Drive destination.
-
-    Crash-Safe & Idempotency Rules:
-    1. Pre-copy hash & size verification of source in staging.
-    2. Duplicate content check (exact SHA-256 match in destination directory).
-    3. Safe collision avoidance for same-name different-content files.
-    4. Destination staging via '.part-<job_id>' temporary file inside destination.
-    5. Post-copy SHA-256 and size verification of destination before replacing target.
-    6. State update to 'completed'.
-    7. Safe cleanup of local source temp file.
-    """
+    """Safely verify integrity, check duplicate/collision, and copy to Google Drive destination."""
     check_cancellation(cancel_event)
 
     if not os.path.exists(temp_path):
         raise NonRetryableTransferError(f"الملف المؤقت المصدر غير موجود: {temp_path}")
 
-    # Step 1: Hash and measure local source
     source_sha, source_size = hash_file(temp_path)
     if source_size == 0:
         raise NonRetryableTransferError("الملف المؤقت فارغ (حجمه صفر).")
@@ -261,6 +269,7 @@ def finalize_to_drive(
     target_filename = safe_filename(filename)
     target_path = os.path.join(destination, target_filename)
 
+    # Transition to verifying
     state_store.update_job(
         job_id,
         status="verifying",
@@ -270,19 +279,15 @@ def finalize_to_drive(
         destination_path=target_path,
     )
 
-    # Step 2: Content duplicate & collision resolution
     action = "copied"
     is_duplicate = False
 
-    # Check if target_path exists
     if os.path.exists(target_path):
         try:
             existing_sha, existing_size = hash_file(target_path)
             if existing_size == source_size and existing_sha == source_sha:
-                # Exact identical file already exists at target
                 logger.info("Identical file already exists at destination: %s", target_path)
                 state_store.update_job(job_id, status="completed", destination_path=target_path)
-                # Cleanup local temp
                 try:
                     os.remove(temp_path)
                 except OSError:
@@ -297,12 +302,10 @@ def finalize_to_drive(
         except OSError as exc:
             logger.warning("Could not hash existing file at %s: %s", target_path, exc)
 
-        # Same filename, different content -> Resolve collision deterministically
         action = "collision_renamed"
         stem, ext = os.path.splitext(target_filename)
         counter = 1
         while os.path.exists(target_path):
-            # Also check if collision candidate happens to be exact content duplicate
             try:
                 cand_sha, cand_size = hash_file(target_path)
                 if cand_size == source_size and cand_sha == source_sha:
@@ -326,21 +329,17 @@ def finalize_to_drive(
 
     check_cancellation(cancel_event)
 
-    # Step 3: Copy to destination using a job-tagged partial file for atomic landing
     dest_part_path = os.path.join(destination, f".part_{job_id}_{target_filename}")
     try:
         shutil.copyfile(temp_path, dest_part_path)
-
         check_cancellation(cancel_event)
 
-        # Step 4: True integrity verification of destination file
         dest_sha, dest_size = hash_file(dest_part_path)
         if dest_size != source_size or dest_sha != source_sha:
             raise TransferError(
                 f"فشل التحقق من تكامل الملف في درايف: المصدر ({source_sha}, {source_size}) != الهدف ({dest_sha}, {dest_size})"
             )
 
-        # Step 5: Atomic move into final destination filename
         os.replace(dest_part_path, target_path)
 
     except Exception:
@@ -351,7 +350,6 @@ def finalize_to_drive(
                 pass
         raise
 
-    # Step 6: Mark completed in state
     state_store.update_job(
         job_id,
         status="completed",
@@ -360,7 +358,6 @@ def finalize_to_drive(
         size=source_size,
     )
 
-    # Step 7: Clean up local staging temp file
     try:
         if os.path.exists(temp_path):
             os.remove(temp_path)
