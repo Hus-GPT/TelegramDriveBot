@@ -1,52 +1,69 @@
+"""Google Colab startup and orchestration script."""
+
+import logging
 import os
+import sys
 
-from .bot import TelegramDriveBot
-from .config import load_config
-from .state import StateStore
+from app.config import Config
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("colab_start")
 
 
-def secret(name: str, default: str = "") -> str:
-    value = os.getenv(name, "").strip()
-    if value:
-        return value
+def main() -> None:
+    logger.info("Initializing TelegramDriveBot...")
+
     try:
-        from google.colab import userdata
-        return str(userdata.get(name) or default).strip()
-    except Exception:
-        return default
+        config = Config.from_env()
+    except Exception as exc:
+        logger.error("Configuration failed: %s", exc)
+        sys.exit(1)
 
+    # Check Drive destination
+    if not os.path.exists("/content/drive/MyDrive"):
+        logger.warning(
+            "Drive does not appear to be mounted at /content/drive/MyDrive! "
+            "Please call drive.mount('/content/drive') first if running in Colab."
+        )
 
-def main():
     try:
-        from google.colab import drive
-    except ImportError as exc:
-        raise RuntimeError("هذا المشغل مخصص لبيئة Google Colab.") from exc
+        os.makedirs(config.DRIVE_DESTINATION, exist_ok=True)
+        os.makedirs(config.LOCAL_STAGING_DIR, exist_ok=True)
+    except Exception as exc:
+        logger.error("Failed to prepare directories: %s", exc)
+        sys.exit(1)
 
-    drive.mount("/content/drive", force_remount=False)
+    logger.info("Configuration validated.")
+    logger.info("• Drive Destination: %s", config.DRIVE_DESTINATION)
+    logger.info("• Staging Directory: %s", config.LOCAL_STAGING_DIR)
+    logger.info("• State Storage: %s", config.STATE_PATH)
+    logger.info("• Authorized Owner ID: %d", config.OWNER_ID)
 
-    os.environ["TELEGRAM_BOT_TOKEN"] = secret("TELEGRAM_BOT_TOKEN")
-    os.environ["OWNER_TELEGRAM_ID"] = secret("OWNER_TELEGRAM_ID")
-    os.environ["DRIVE_DESTINATION"] = secret(
-        "DRIVE_DESTINATION",
-        "/content/drive/MyDrive/TelegramDriveBot",
-    )
-    os.environ["FILE2URL_BOT_USERNAME"] = secret(
-        "FILE2URL_BOT_USERNAME",
-        "@File2url_rbot",
-    )
+    from app.bot import TelegramDriveBotApp
 
-    config = load_config()
-    os.makedirs(config.drive_destination, exist_ok=True)
-    os.makedirs(config.temp_root, exist_ok=True)
+    bot_app = TelegramDriveBotApp(config)
+    total_loaded = len(bot_app.state.all_jobs())
+    logger.info("StateStore loaded %d historical jobs.", total_loaded)
 
-    state = StateStore(config.state_file)
-    bot = TelegramDriveBot(config, state)
-    application = bot.build_application()
+    bot_app.restore_unfinished()
+    queued_count = bot_app.queue.qsize()
+    logger.info("Recovery completed. %d unfinished jobs reconstructed in queue.", queued_count)
 
-    print("🟢 TelegramDriveBot starting...")
-    print(f"📁 Drive destination: {config.drive_destination}")
-    print("🔐 Owner-only access enabled")
-    application.run_polling(allowed_updates=None, drop_pending_updates=False)
+    app = bot_app.build_application()
+
+    # Start single async worker alongside Telegram polling
+    async def post_init(application):
+        import asyncio
+        bot_app.worker_task = asyncio.create_task(bot_app.worker_loop())
+        logger.info("Single-worker queue processing loop started.")
+
+    app.post_init = post_init
+
+    logger.info("Starting Telegram polling mode...")
+    app.run_polling()
 
 
 if __name__ == "__main__":

@@ -28,6 +28,8 @@ class Config:
     MAX_RETRIES: int = 3
     FILE2URL_BOT_USERNAME: str = "File2url_rbot"
     FILE2URL_TIMEOUT: int = 120
+    PROGRESS_INTERVAL: float = 3.0  # seconds between Telegram message progress edits
+    STATUS_HISTORY_COUNT: int = 5   # number of recent jobs to show in /status and /history
 
     @classmethod
     def from_env(cls) -> Config:
@@ -52,4 +54,6 @@ class Config:
             MAX_RETRIES=int(_get_val("MAX_RETRIES", "3")),
             FILE2URL_BOT_USERNAME=_get_val("FILE2URL_BOT_USERNAME", "File2url_rbot"),
             FILE2URL_TIMEOUT=int(_get_val("FILE2URL_TIMEOUT", "120")),
+            PROGRESS_INTERVAL=float(_get_val("PROGRESS_INTERVAL", "3.0")),
+            STATUS_HISTORY_COUNT=int(_get_val("STATUS_HISTORY_COUNT", "5")),
         )

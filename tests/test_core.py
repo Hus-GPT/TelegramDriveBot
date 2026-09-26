@@ -1,4 +1,4 @@
-"""Comprehensive automated test suite for TelegramDriveBot Core Reliability."""
+"""Comprehensive automated test suite for TelegramDriveBot Core Reliability & Milestone 2 UX."""
 
 import asyncio
 import hashlib
@@ -24,6 +24,7 @@ from app.transfer import (
     safe_filename,
 )
 from app.bot import File2URLProvider, TelegramDriveBotApp
+from app.ui import ProgressTracker, format_bytes, format_duration, humanize_error
 
 
 @pytest.fixture
@@ -33,7 +34,7 @@ def temp_dirs():
 
 
 # ---------------------------------------------------------
-# 1. State Machine & Transition Tests
+# 1. State Machine & Transition Tests (Milestone 1 Core)
 # ---------------------------------------------------------
 
 def test_state_store_legal_transitions(temp_dirs):
@@ -44,19 +45,15 @@ def test_state_store_legal_transitions(temp_dirs):
     job = store.add_job("j1", "direct_url", "f.bin", 1, 2)
     assert job["status"] == "queued"
 
-    # queued -> downloading
     j1 = store.update_job("j1", status="downloading")
     assert j1["status"] == "downloading"
 
-    # downloading -> downloaded
     j2 = store.update_job("j1", status="downloaded")
     assert j2["status"] == "downloaded"
 
-    # downloaded -> verifying
     j3 = store.update_job("j1", status="verifying")
     assert j3["status"] == "verifying"
 
-    # verifying -> completed
     j4 = store.update_job("j1", status="completed")
     assert j4["status"] == "completed"
 
@@ -68,14 +65,11 @@ def test_state_store_illegal_transitions(temp_dirs):
 
     store.add_job("j_illegal", "direct_url", "f.bin", 1, 2)
 
-    # queued -> completed (illegal)
     with pytest.raises(InvalidStateTransitionError):
         store.update_job("j_illegal", status="completed")
 
-    # queued -> downloading
     store.update_job("j_illegal", status="downloading")
 
-    # downloading -> completed (illegal)
     with pytest.raises(InvalidStateTransitionError):
         store.update_job("j_illegal", status="completed")
 
@@ -88,25 +82,18 @@ def test_state_store_retry_and_recovery(temp_dirs):
     store.add_job("j_retry", "direct_url", "f.bin", 1, 2)
     store.update_job("j_retry", status="failed")
 
-    # Direct illegal transition failed -> downloading must fail
     with pytest.raises(InvalidStateTransitionError):
         store.update_job("j_retry", status="downloading")
 
-    # Controlled retry_job succeeds
     retried = store.retry_job("j_retry")
     assert retried["status"] == "queued"
     assert retried["recovery_from_status"] == "failed"
 
-    # Controlled recover_job succeeds
     store.update_job("j_retry", status="downloading")
     recovered = store.recover_job("j_retry", "queued")
     assert recovered["status"] == "queued"
     assert recovered["recovery_from_status"] == "downloading"
 
-
-# ---------------------------------------------------------
-# 2. Terminal State & Statistics Semantics Tests
-# ---------------------------------------------------------
 
 def test_terminal_state_statistics(temp_dirs):
     _, drive = temp_dirs
@@ -117,22 +104,19 @@ def test_terminal_state_statistics(temp_dirs):
     store.update_job("j1", status="failed")
     assert store.data["stats"]["failed"] == 1
 
-    # Retry job -> failed count must decrease to 0
     store.retry_job("j1")
     assert store.data["stats"]["failed"] == 0
 
-    # Fail it again -> failed count is 1, not 2
     store.update_job("j1", status="failed")
     assert store.data["stats"]["failed"] == 1
 
-    # Reload from disk and verify recalculated stats
     reloaded = StateStore(state_file)
     assert reloaded.data["stats"]["failed"] == 1
     assert reloaded.data["stats"]["completed"] == 0
 
 
 # ---------------------------------------------------------
-# 3. Filename, Content Disposition, and Hashing
+# 2. Filename, Content Disposition, and Hashing (Milestone 1)
 # ---------------------------------------------------------
 
 def test_safe_filename():
@@ -169,7 +153,7 @@ def test_hash_file_and_empty(temp_dirs):
 
 
 # ---------------------------------------------------------
-# 4. Finalize to Drive, Duplicates, and Collisions
+# 3. Finalize to Drive, Duplicates, and Collisions (Milestone 1)
 # ---------------------------------------------------------
 
 def test_finalize_to_drive_success(temp_dirs):
@@ -246,7 +230,6 @@ def test_finalize_filename_collision(temp_dirs):
 def test_finalize_multiple_collisions(temp_dirs):
     staging, drive = temp_dirs
 
-    # Create file.txt, file (1).txt, file (2).txt
     for name, content in [("data.txt", b"v0"), ("data (1).txt", b"v1"), ("data (2).txt", b"v2")]:
         with open(os.path.join(drive, name), "wb") as f:
             f.write(content)
@@ -269,32 +252,26 @@ def test_finalize_multiple_collisions(temp_dirs):
 
 
 def test_duplicate_recovery_when_target_already_completed_on_drive(temp_dirs):
-    """Crash scenario: Colab died after os.replace moved file to target, but before state was updated."""
     staging, drive = temp_dirs
 
     content = b"Content transferred successfully before crash"
     sha, size = hashlib.sha256(content).hexdigest(), len(content)
 
-    # Final target file already completed on Drive
     target_path = os.path.join(drive, "crash_target.bin")
     with open(target_path, "wb") as f:
         f.write(content)
 
-    # Local staging file still present
     local_staging = os.path.join(staging, "crash_staging.bin")
     with open(local_staging, "wb") as f:
         f.write(content)
 
     store = StateStore(os.path.join(drive, "state.json"))
-    # Job remained in 'downloaded' or 'verifying' because state update was interrupted
     store.add_job("j_crash", "direct_url", "crash_target.bin", 1, 2)
     store.update_job("j_crash", status="downloading")
     store.update_job("j_crash", status="downloaded", temp_path=local_staging, sha256=sha, size=size)
 
-    # Run finalization (as worker/recovery would do)
     res = finalize_to_drive(local_staging, "crash_target.bin", drive, store, "j_crash")
 
-    # Confirms duplicate was recognized: skipped re-copying, no duplicate collision file created
     assert res.is_duplicate is True
     assert res.action == "duplicate_skipped"
     assert res.destination_path == target_path
@@ -304,7 +281,7 @@ def test_duplicate_recovery_when_target_already_completed_on_drive(temp_dirs):
 
 
 # ---------------------------------------------------------
-# 5. Safe Orphan Drive Partial Cleanup
+# 4. Safe Orphan Drive Partial Cleanup (Milestone 1)
 # ---------------------------------------------------------
 
 def test_clean_orphan_drive_partials(temp_dirs):
@@ -335,7 +312,7 @@ def test_clean_orphan_drive_partials(temp_dirs):
 
 
 # ---------------------------------------------------------
-# 6. File2URL Serialized Provider Tests
+# 5. File2URL Serialized Provider Tests (Milestone 1)
 # ---------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -364,7 +341,7 @@ async def test_file2url_cancellation():
 
 
 # ---------------------------------------------------------
-# 7. Queued Job Cancellation
+# 6. Cancellation & Worker Safety (Milestone 1)
 # ---------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -398,7 +375,7 @@ async def test_queued_job_cancellation_skips_worker(temp_dirs):
 
 
 # ---------------------------------------------------------
-# 8. Deterministic Recovery Tests
+# 7. Deterministic Recovery Tests (Milestone 1)
 # ---------------------------------------------------------
 
 def test_restore_unfinished_branches(temp_dirs):
@@ -412,14 +389,12 @@ def test_restore_unfinished_branches(temp_dirs):
     )
     app = TelegramDriveBotApp(cfg)
 
-    # Branch 1: downloading job -> reset to queued and clean local staging
     part_stage = os.path.join(staging, "part1.bin")
     with open(part_stage, "wb") as f:
         f.write(b"broken")
     app.state.add_job("j_dl", "direct_url", "f1.bin", 1, 2)
     app.state.update_job("j_dl", status="downloading", temp_path=part_stage)
 
-    # Branch 2: downloaded job with valid temp_path -> preserved
     valid_stage = os.path.join(staging, "valid.bin")
     with open(valid_stage, "wb") as f:
         f.write(b"intact content")
@@ -428,12 +403,10 @@ def test_restore_unfinished_branches(temp_dirs):
     app.state.update_job("j_valid", status="downloading")
     app.state.update_job("j_valid", status="downloaded", temp_path=valid_stage, sha256=v_sha, size=v_size)
 
-    # Branch 3: downloaded job with missing temp_path -> reset to queued
     app.state.add_job("j_lost", "direct_url", "lost.bin", 1, 2)
     app.state.update_job("j_lost", status="downloading")
     app.state.update_job("j_lost", status="downloaded", temp_path=os.path.join(staging, "missing.bin"))
 
-    # Branch 4: verifying job with valid temp_path and leftover Drive .part -> cleans .part and recovers to downloaded
     dest_part = os.path.join(drive, ".part_j_ver_valid2.bin")
     with open(dest_part, "wb") as f:
         f.write(b"leftover dest part")
@@ -480,28 +453,24 @@ def test_recovery_idempotency(temp_dirs):
     app.state.update_job("j_idem", status="downloading")
     app.state.update_job("j_idem", status="downloaded", temp_path=valid_stage, sha256=v_sha, size=v_size)
 
-    # First recovery
     app.restore_unfinished()
     state_after_1 = json.dumps(app.state.data, sort_keys=True)
     q_size_1 = app.queue.qsize()
 
-    # Empty queue to simulate clean queue before re-run
     while not app.queue.empty():
         app.queue.get_nowait()
 
-    # Second recovery
     app.restore_unfinished()
     state_after_2 = json.dumps(app.state.data, sort_keys=True)
     q_size_2 = app.queue.qsize()
 
-    # Must produce identical structural state
     assert q_size_1 == q_size_2 == 1
     assert app.state.get_job("j_idem")["status"] == "downloaded"
     assert len(app.state.all_jobs()) == 1
 
 
 # ---------------------------------------------------------
-# 9. Telegram Message ID Persistence
+# 8. Metadata & Download Errors (Milestone 1)
 # ---------------------------------------------------------
 
 def test_telegram_message_id_persisted(temp_dirs):
@@ -523,11 +492,8 @@ def test_telegram_message_id_persisted(temp_dirs):
     assert reloaded.get_job("j_msg")["telegram_message_id"] == 98765
 
 
-# ---------------------------------------------------------
-# 10. Download Error Classification Tests
-# ---------------------------------------------------------
-
 def test_download_error_classification(temp_dirs):
+    import requests
     staging, _ = temp_dirs
 
     class MockResponse:
@@ -544,40 +510,30 @@ def test_download_error_classification(temp_dirs):
         def iter_content(self, chunk_size=1024):
             yield self._content
 
-    # 404 -> NonRetryableTransferError
     with patch("requests.Session.get", return_value=MockResponse(404)):
         with pytest.raises(NonRetryableTransferError):
             download_url("http://mock/404", staging, max_retries=1)
 
-    # 403 -> NonRetryableTransferError
     with patch("requests.Session.get", return_value=MockResponse(403)):
         with pytest.raises(NonRetryableTransferError):
             download_url("http://mock/403", staging, max_retries=1)
 
-    # HTML content -> NonRetryableTransferError
     with patch("requests.Session.get", return_value=MockResponse(200, b"<html></html>", {"Content-Type": "text/html"})):
         with pytest.raises(NonRetryableTransferError):
             download_url("http://mock/html", staging, max_retries=1)
 
-    # 0 bytes -> NonRetryableTransferError
     with patch("requests.Session.get", return_value=MockResponse(200, b"", {"Content-Type": "application/octet-stream"})):
         with pytest.raises(NonRetryableTransferError):
             download_url("http://mock/empty", staging, max_retries=1)
 
-    # 500 Server error -> RetryableTransferError (retries exhausted)
     with patch("requests.Session.get", return_value=MockResponse(500)):
         with pytest.raises(RetryableTransferError):
             download_url("http://mock/500", staging, max_retries=2)
 
-    # 429 Rate limit -> RetryableTransferError (retries exhausted)
     with patch("requests.Session.get", return_value=MockResponse(429)):
         with pytest.raises(RetryableTransferError):
             download_url("http://mock/429", staging, max_retries=2)
 
-
-# ---------------------------------------------------------
-# 11. Owner Authorization & Unauthorized Message Rejection
-# ---------------------------------------------------------
 
 def test_owner_authorization(temp_dirs):
     _, drive = temp_dirs
@@ -597,3 +553,242 @@ def test_owner_authorization(temp_dirs):
     mock_unauth_update = MagicMock()
     mock_unauth_update.effective_user.id = 111222
     assert app.is_authorized(mock_unauth_update) is False
+
+
+# =========================================================
+# MILESTONE 2: UX, Commands, Formatting & Failure Isolation
+# =========================================================
+
+def test_ui_helpers_formatting():
+    assert format_bytes(500) == "500 B"
+    assert format_bytes(1536) == "1.5 KB"
+    assert format_bytes(5 * 1024 * 1024) == "5.00 MB"
+    assert format_bytes(2 * 1024 * 1024 * 1024) == "2.00 GB"
+    assert format_bytes(None) == "غير معروف"
+
+    assert format_duration(35) == "35s"
+    assert format_duration(95) == "1m 35s"
+    assert format_duration(3665) == "1h 1m"
+    assert format_duration(None) == "--"
+
+
+def test_humanize_error_translations():
+    err_404 = humanize_error(Exception("فشل التحميل (رمز HTTP غير قابل لإعادة المحاولة: 404)"))
+    assert "غير موجود" in err_404
+
+    err_403 = humanize_error(Exception("403 Forbidden"))
+    assert "تم رفض الوصول" in err_403
+
+    err_html = humanize_error(Exception("الرابط يشير إلى صفحة ويب (HTML)"))
+    assert "صفحة ويب" in err_html
+
+    err_cancel = humanize_error(Exception("تم إلغاء عملية النقل بواسطة المستخدم."))
+    assert "تم إلغاء العملية بأمر منك" in err_cancel
+
+    err_empty = humanize_error(Exception("الملف فارغ بحجم صفر بايت"))
+    assert "فارغ" in err_empty
+
+    # Verify sensitive token is never leaked
+    err_secret = humanize_error(Exception("SensitiveToken123456 unexpected failure"))
+    assert "SensitiveToken123456" not in err_secret
+    assert "تعذر إكمال عملية النقل" in err_secret
+
+
+def test_progress_tracker_throttling():
+    tracker = ProgressTracker("test.zip", min_interval=2.0)
+    # First update triggers
+    assert tracker.should_update(100, 1000) is True
+
+    # Immediate second call should be throttled
+    assert tracker.should_update(200, 1000) is False
+
+    # Text structure
+    text = tracker.build_progress_text(500, 1000)
+    assert "test.zip" in text
+    assert "50.0%" in text
+
+    # Unknown total size text structure
+    text_unknown = tracker.build_progress_text(500, None)
+    assert "غير محدد" in text_unknown
+
+
+@pytest.mark.asyncio
+async def test_cmd_start_and_help(temp_dirs):
+    staging, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=777,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+
+    # Authorized update
+    update = MagicMock()
+    update.effective_user.id = 777
+    update.effective_message.reply_text = AsyncMock()
+
+    context = MagicMock()
+
+    await app.cmd_start(update, context)
+    update.effective_message.reply_text.assert_called_once()
+    start_reply = update.effective_message.reply_text.call_args[0][0]
+    assert "TelegramDriveBot" in start_reply
+    assert "/status" in start_reply
+
+    update.effective_message.reply_text.reset_mock()
+    await app.cmd_help(update, context)
+    help_reply = update.effective_message.reply_text.call_args[0][0]
+    assert "/retry" in help_reply
+    assert "/cancel" in help_reply
+
+
+@pytest.mark.asyncio
+async def test_cmd_status_and_history(temp_dirs):
+    staging, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=777,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+
+    app.state.add_job("j_done1", "direct_url", "file1.bin", 777, 777)
+    app.state.update_job("j_done1", status="completed", size=1024 * 1024)
+
+    app.state.add_job("j_act", "direct_url", "file_active.bin", 777, 777)
+    app.state.update_job("j_act", status="downloading", size=2 * 1024 * 1024)
+    app.active_jobs["j_act"] = app.state.get_job("j_act")
+
+    update = MagicMock()
+    update.effective_user.id = 777
+    update.effective_message.reply_text = AsyncMock()
+    context = MagicMock()
+
+    # /status
+    await app.cmd_status(update, context)
+    status_text = update.effective_message.reply_text.call_args[0][0]
+    assert "file_active.bin" in status_text
+    assert "j_act" in status_text
+
+    # /history
+    update.effective_message.reply_text.reset_mock()
+    await app.cmd_history(update, context)
+    hist_text = update.effective_message.reply_text.call_args[0][0]
+    assert "file1.bin" in hist_text
+    assert "j_done1" in hist_text
+
+
+@pytest.mark.asyncio
+async def test_cmd_cancel_modes(temp_dirs):
+    staging, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=777,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+
+    update = MagicMock()
+    update.effective_user.id = 777
+    update.effective_message.reply_text = AsyncMock()
+    context = MagicMock()
+
+    # 1. /cancel with no active transfer
+    context.args = []
+    await app.cmd_cancel(update, context)
+    assert "لا توجد عملية نشطة" in update.effective_message.reply_text.call_args[0][0]
+
+    # 2. /cancel with active transfer (default targeting)
+    app.state.add_job("j_active_canc", "direct_url", "act.bin", 777, 777)
+    app.state.update_job("j_active_canc", status="downloading")
+    app.active_jobs["j_active_canc"] = app.state.get_job("j_active_canc")
+    evt = threading.Event()
+    app.cancel_events["j_active_canc"] = evt
+
+    update.effective_message.reply_text.reset_mock()
+    await app.cmd_cancel(update, context)
+    assert evt.is_set()
+    assert "تم إلغاء المهمة" in update.effective_message.reply_text.call_args[0][0]
+    assert app.state.get_job("j_active_canc")["status"] == "cancelled"
+
+    # 3. /cancel on already completed job
+    app.state.add_job("j_done_canc", "direct_url", "done.bin", 777, 777)
+    app.state.update_job("j_done_canc", status="completed")
+    context.args = ["j_done_canc"]
+    update.effective_message.reply_text.reset_mock()
+    await app.cmd_cancel(update, context)
+    assert "مكتملة بالفعل ولا يمكن إلغاؤها" in update.effective_message.reply_text.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_cmd_retry_validation(temp_dirs):
+    staging, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=777,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+
+    update = MagicMock()
+    update.effective_user.id = 777
+    update.effective_message.reply_text = AsyncMock()
+    context = MagicMock()
+
+    # 1. /retry without args
+    context.args = []
+    await app.cmd_retry(update, context)
+    assert "يرجى تحديد معرّف المهمة" in update.effective_message.reply_text.call_args[0][0]
+
+    # 2. /retry on active job
+    app.state.add_job("j_act_ret", "direct_url", "a.bin", 777, 777)
+    app.state.update_job("j_act_ret", status="downloading")
+    context.args = ["j_act_ret"]
+    update.effective_message.reply_text.reset_mock()
+    await app.cmd_retry(update, context)
+    assert "جارية أو في الانتظار بالفعل" in update.effective_message.reply_text.call_args[0][0]
+
+    # 3. /retry on completed job
+    app.state.add_job("j_comp_ret", "direct_url", "c.bin", 777, 777)
+    app.state.update_job("j_comp_ret", status="completed")
+    context.args = ["j_comp_ret"]
+    update.effective_message.reply_text.reset_mock()
+    await app.cmd_retry(update, context)
+    assert "مكتملة بنجاح" in update.effective_message.reply_text.call_args[0][0]
+
+    # 4. /retry on failed job succeeds and enqueues
+    app.state.add_job("j_fail_ret", "direct_url", "f.bin", 777, 777)
+    app.state.update_job("j_fail_ret", status="failed")
+    context.args = ["j_fail_ret"]
+    update.effective_message.reply_text.reset_mock()
+    await app.cmd_retry(update, context)
+    assert "تمت إعادة جدولة المهمة" in update.effective_message.reply_text.call_args[0][0]
+    assert app.state.get_job("j_fail_ret")["status"] == "queued"
+    assert app.queue.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_ui_failure_isolation():
+    """Verify that Telegram UI message editing failures never cause underlying operations to fail."""
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=777,
+        DRIVE_DESTINATION="/tmp",
+        LOCAL_STAGING_DIR="/tmp",
+        STATE_PATH="/tmp/state.json",
+    )
+    app = TelegramDriveBotApp(cfg)
+    app.application = MagicMock()
+    app.application.bot.edit_message_text = AsyncMock(side_effect=Exception("Telegram Network Timeout"))
+
+    # Calling safe_edit_text catches exception cleanly and returns False
+    res = await app.safe_edit_text(123, 456, "Sample text")
+    assert res is False

@@ -31,6 +31,14 @@ In the left sidebar of Google Colab, open **Secrets** (key icon) and set:
 * `TELEGRAM_BOT_TOKEN`: The API token from `@BotFather`.
 * `OWNER_ID`: Your numerical Telegram user ID (from `@userinfobot`).
 
+## Operational Commands (Milestone 2)
+
+* `/status` : View real-time bot state, active job, queue count, and transfer metrics.
+* `/history` : Review recent completed, failed, and cancelled transfer history.
+* `/cancel` : Safely cancel the currently active transfer, or specify a job ID via `/cancel <job_id>`.
+* `/retry <job_id>` : Requeue failed or cancelled transfers with original metadata.
+* `/help` : View available commands and operational notes.
+
 ## How Persistence & Recovery Work
 
 * **State Storage:** Saved directly to your Google Drive at:
