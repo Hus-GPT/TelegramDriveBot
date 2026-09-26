@@ -4,7 +4,7 @@ This guide describes how to run TelegramDriveBot inside a Google Colab notebook 
 
 ## One-Cell Startup
 
-Paste and run the following command in a single Colab cell:
+Paste and run the following in a single Colab cell:
 
 ```python
 import os
@@ -41,3 +41,4 @@ In the left sidebar of Google Colab, open **Secrets** (key icon) and set:
 * **File2URL Forwarding:**
   * Telegram restricts Bot API downloads to 20MB. Media over 20MB is forwarded to `@File2url_rbot`.
   * The single-worker engine waits up to 120s for the external response. If the external bot fails or times out, the job fails cleanly without stalling subsequent transfers.
+  * Invariant: exactly one File2URL exchange is active at any time; unsolicited or late messages are safely discarded.

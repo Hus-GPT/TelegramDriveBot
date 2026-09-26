@@ -28,12 +28,12 @@ class TransferError(Exception):
 
 
 class NonRetryableTransferError(TransferError):
-    """Explicitly non-retryable transfer failure (e.g. 404, 403, bad request, cancelled)."""
+    """Explicitly non-retryable transfer failure (e.g. 400, 401, 403, 404, 405, 410, bad request, cancelled)."""
     pass
 
 
 class RetryableTransferError(TransferError):
-    """Failure that may succeed upon a subsequent retry attempt (timeouts, 5xx)."""
+    """Failure that may succeed upon a subsequent retry attempt (timeouts, 408, 429, 5xx)."""
     pass
 
 
@@ -99,7 +99,7 @@ def parse_content_disposition(header: str) -> Optional[str]:
 
 
 def hash_file(filepath: str, chunk_size: int = CHUNK_SIZE) -> Tuple[str, int]:
-    """Calculate SHA-256 hash and exact byte size incrementally."""
+    """Calculate SHA-256 hash and exact byte size incrementally in chunks."""
     hasher = hashlib.sha256()
     total_bytes = 0
     with open(filepath, "rb") as f:
@@ -126,7 +126,12 @@ def download_url(
     max_retries: int = 3,
     progress_callback: Optional[Callable[[int, Optional[int]], None]] = None,
 ) -> Tuple[str, str, int]:
-    """Stream download a direct URL into a temporary file safely."""
+    """Stream download a direct URL into a temporary file safely.
+
+    Error Classification:
+    - Non-retryable: 400, 401, 403, 404, 405, 410, HTML landing pages, zero-byte file, user cancellation.
+    - Retryable: 408 (Request Timeout), 429 (Too Many Requests), 5xx (Server Errors), connection drops, chunk timeouts.
+    """
     os.makedirs(temp_root, exist_ok=True)
     last_error: Optional[Exception] = None
 
@@ -145,10 +150,11 @@ def download_url(
                 headers={"User-Agent": "TelegramDriveBot/2.0"},
             )
 
+            # Strict error classification
             if response.status_code in {400, 401, 403, 404, 405, 410}:
                 raise NonRetryableTransferError(f"فشل التحميل (رمز HTTP غير قابل لإعادة المحاولة: {response.status_code})")
-            if response.status_code >= 500:
-                raise RetryableTransferError(f"خطأ خادم مؤقت (HTTP {response.status_code})")
+            if response.status_code in {408, 429} or response.status_code >= 500:
+                raise RetryableTransferError(f"خطأ مؤقت قابل لإعادة المحاولة (HTTP {response.status_code})")
             response.raise_for_status()
 
             content_type = response.headers.get("Content-Type", "").lower()
@@ -216,9 +222,9 @@ def clean_orphan_drive_partials(destination_dir: str, state_store: Any) -> List[
     """Safely removes only orphaned .part_<job_id>_* files from Google Drive destination.
 
     A partial file is an orphan IF AND ONLY IF:
-    1. It matches the project-specific naming convention '.part_<job_id>_*'
+    1. It strictly matches the project-specific naming convention '.part_<job_id>_*'
     2. The associated job does not exist in StateStore, OR the job is in a terminal state (completed, failed, cancelled).
-    Never touches any other user files.
+    Never touches any valid destination files or unrelated files.
     """
     cleaned: List[str] = []
     if not os.path.exists(destination_dir):
@@ -227,7 +233,6 @@ def clean_orphan_drive_partials(destination_dir: str, state_store: Any) -> List[
     pattern = os.path.join(destination_dir, ".part_*_*")
     for part_path in glob.glob(pattern):
         filename = os.path.basename(part_path)
-        # Extract job_id: format is .part_{job_id}_{orig_name}
         match = re.match(r"^\.part_([^_]+)_(.+)$", filename)
         if not match:
             continue
@@ -235,7 +240,6 @@ def clean_orphan_drive_partials(destination_dir: str, state_store: Any) -> List[
         job_id = match.group(1)
         job = state_store.get_job(job_id) if hasattr(state_store, "get_job") else None
 
-        # Orphan if job does not exist or is in terminal state
         if not job or job.get("status") in {"completed", "failed", "cancelled"}:
             try:
                 os.remove(part_path)
@@ -269,7 +273,7 @@ def finalize_to_drive(
     target_filename = safe_filename(filename)
     target_path = os.path.join(destination, target_filename)
 
-    # Transition to verifying
+    # Transition to verifying in state machine
     state_store.update_job(
         job_id,
         status="verifying",
@@ -340,6 +344,7 @@ def finalize_to_drive(
                 f"فشل التحقق من تكامل الملف في درايف: المصدر ({source_sha}, {source_size}) != الهدف ({dest_sha}, {dest_size})"
             )
 
+        # Atomic promotion
         os.replace(dest_part_path, target_path)
 
     except Exception:

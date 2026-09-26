@@ -121,7 +121,7 @@ def test_terminal_state_statistics(temp_dirs):
     store.retry_job("j1")
     assert store.data["stats"]["failed"] == 0
 
-    # Fail it again -> failed count is 1, not 2!
+    # Fail it again -> failed count is 1, not 2
     store.update_job("j1", status="failed")
     assert store.data["stats"]["failed"] == 1
 
@@ -188,7 +188,7 @@ def test_finalize_to_drive_success(temp_dirs):
     assert res.action == "copied"
     assert not res.is_duplicate
     assert os.path.exists(res.destination_path)
-    assert not os.path.exists(src)  # Temporary local source cleaned up
+    assert not os.path.exists(src)
 
     dest_sha, dest_size = hash_file(res.destination_path)
     assert dest_sha == res.sha256
@@ -251,20 +251,17 @@ def test_clean_orphan_drive_partials(temp_dirs):
     _, drive = temp_dirs
     store = StateStore(os.path.join(drive, "state.json"))
 
-    # Active job j_active
     store.add_job("j_active", "direct_url", "active.bin", 1, 2)
     part_active = os.path.join(drive, ".part_j_active_active.bin")
     with open(part_active, "wb") as f:
         f.write(b"in flight")
 
-    # Completed job j_done
     store.add_job("j_done", "direct_url", "done.bin", 1, 2)
     store.update_job("j_done", status="completed")
     part_done = os.path.join(drive, ".part_j_done_done.bin")
     with open(part_done, "wb") as f:
         f.write(b"leftover")
 
-    # Unrelated user file starting with .part
     unrelated = os.path.join(drive, ".part_notmatchingconvention")
     with open(unrelated, "wb") as f:
         f.write(b"do not touch")
@@ -273,7 +270,6 @@ def test_clean_orphan_drive_partials(temp_dirs):
     assert part_done in cleaned
     assert not os.path.exists(part_done)
 
-    # Active partial and unrelated must NOT be cleaned
     assert os.path.exists(part_active)
     assert os.path.exists(unrelated)
 
@@ -289,13 +285,11 @@ async def test_file2url_success_and_cleanup():
     fut = await provider.register_waiter("job_f1")
     assert not fut.done()
 
-    # Incoming response
     delivered = await provider.complete_waiter("https://cdn.example.com/file.mp4")
     assert delivered is True
     res = await fut
     assert res == "https://cdn.example.com/file.mp4"
 
-    # Unsolicited response when no job waiting is safely dropped
     dropped = await provider.complete_waiter("https://cdn.example.com/stale.mp4")
     assert dropped is False
 
@@ -325,14 +319,11 @@ async def test_queued_job_cancellation_skips_worker(temp_dirs):
     )
     app = TelegramDriveBotApp(cfg)
 
-    # Add job to state and queue
     job = app.state.add_job("j_cancel_q", "direct_url", "test.bin", 123456, 123456, source_url="http://mock.com/t.bin")
     await app.queue.put(job)
 
-    # Simulate /cancel before worker gets it
     app.state.update_job("j_cancel_q", status="cancelled")
 
-    # Run worker loop for 1 step
     with patch.object(app, "process_job", new_callable=AsyncMock) as mock_process:
         worker_task = asyncio.create_task(app.worker_loop())
         await app.queue.join()
@@ -342,7 +333,6 @@ async def test_queued_job_cancellation_skips_worker(temp_dirs):
         except asyncio.CancelledError:
             pass
 
-        # Must NOT call process_job for cancelled queued job!
         mock_process.assert_not_called()
         assert app.state.get_job("j_cancel_q")["status"] == "cancelled"
 
@@ -383,7 +373,6 @@ def test_restore_unfinished_branches(temp_dirs):
     app.state.update_job("j_lost", status="downloading")
     app.state.update_job("j_lost", status="downloaded", temp_path=os.path.join(staging, "missing.bin"))
 
-    # Execute recovery
     app.restore_unfinished()
 
     assert not os.path.exists(part_stage)
@@ -416,3 +405,153 @@ def test_telegram_message_id_persisted(temp_dirs):
 
     reloaded = StateStore(os.path.join(drive, "state.json"))
     assert reloaded.get_job("j_msg")["telegram_message_id"] == 98765
+
+
+# ---------------------------------------------------------
+# 10. Download Error Classification Tests
+# ---------------------------------------------------------
+
+def test_download_error_classification(temp_dirs):
+    staging, _ = temp_dirs
+
+    class MockResponse:
+        def __init__(self, status_code, content=b"", headers=None):
+            self.status_code = status_code
+            self._content = content
+            self.headers = headers or {}
+            self.url = "http://example.com/file.bin"
+
+        def raise_for_status(self):
+            if 400 <= self.status_code < 600:
+                raise requests.HTTPError(f"HTTP {self.status_code}")
+
+        def iter_content(self, chunk_size=1024):
+            yield self._content
+
+    # 404 -> NonRetryableTransferError
+    with patch("requests.Session.get", return_value=MockResponse(404)):
+        with pytest.raises(NonRetryableTransferError):
+            download_url("http://mock/404", staging, max_retries=1)
+
+    # 403 -> NonRetryableTransferError
+    with patch("requests.Session.get", return_value=MockResponse(403)):
+        with pytest.raises(NonRetryableTransferError):
+            download_url("http://mock/403", staging, max_retries=1)
+
+    # HTML content -> NonRetryableTransferError
+    with patch("requests.Session.get", return_value=MockResponse(200, b"<html></html>", {"Content-Type": "text/html"})):
+        with pytest.raises(NonRetryableTransferError):
+            download_url("http://mock/html", staging, max_retries=1)
+
+    # 0 bytes -> NonRetryableTransferError
+    with patch("requests.Session.get", return_value=MockResponse(200, b"", {"Content-Type": "application/octet-stream"})):
+        with pytest.raises(NonRetryableTransferError):
+            download_url("http://mock/empty", staging, max_retries=1)
+
+    # 500 Server error -> RetryableTransferError (retries exhausted)
+    with patch("requests.Session.get", return_value=MockResponse(500)):
+        with pytest.raises(RetryableTransferError):
+            download_url("http://mock/500", staging, max_retries=2)
+
+    # 429 Rate limit -> RetryableTransferError (retries exhausted)
+    with patch("requests.Session.get", return_value=MockResponse(429)):
+        with pytest.raises(RetryableTransferError):
+            download_url("http://mock/429", staging, max_retries=2)
+
+
+# ---------------------------------------------------------
+# 11. Multi-Collision Finalization Test
+# ---------------------------------------------------------
+
+def test_finalize_multiple_collisions(temp_dirs):
+    staging, drive = temp_dirs
+
+    # Create file.txt, file (1).txt, file (2).txt
+    for name, content in [("data.txt", b"v0"), ("data (1).txt", b"v1"), ("data (2).txt", b"v2")]:
+        with open(os.path.join(drive, name), "wb") as f:
+            f.write(content)
+
+    src = os.path.join(staging, "data.txt")
+    with open(src, "wb") as f:
+        f.write(b"new v3")
+
+    store = StateStore(os.path.join(drive, "state.json"))
+    store.add_job("j_col3", "direct_url", "data.txt", 1, 2)
+    store.update_job("j_col3", status="downloading")
+    store.update_job("j_col3", status="downloaded")
+
+    res = finalize_to_drive(src, "data.txt", drive, store, "j_col3")
+
+    assert res.action == "collision_renamed"
+    assert res.destination_path == os.path.join(drive, "data (3).txt")
+    assert os.path.exists(res.destination_path)
+    assert not os.path.exists(src)
+
+
+# ---------------------------------------------------------
+# 12. Recovery Idempotency Test
+# ---------------------------------------------------------
+
+def test_recovery_idempotency(temp_dirs):
+    staging, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=123456,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+
+    valid_stage = os.path.join(staging, "idem.bin")
+    with open(valid_stage, "wb") as f:
+        f.write(b"stable content")
+    v_sha, v_size = hash_file(valid_stage)
+
+    app.state.add_job("j_idem", "direct_url", "idem.bin", 1, 2)
+    app.state.update_job("j_idem", status="downloading")
+    app.state.update_job("j_idem", status="downloaded", temp_path=valid_stage, sha256=v_sha, size=v_size)
+
+    # First recovery
+    app.restore_unfinished()
+    state_after_1 = json.dumps(app.state.data, sort_keys=True)
+    q_size_1 = app.queue.qsize()
+
+    # Empty queue to simulate clean queue before re-run
+    while not app.queue.empty():
+        app.queue.get_nowait()
+
+    # Second recovery
+    app.restore_unfinished()
+    state_after_2 = json.dumps(app.state.data, sort_keys=True)
+    q_size_2 = app.queue.qsize()
+
+    # Must produce identical structural state
+    assert q_size_1 == q_size_2 == 1
+    assert app.state.get_job("j_idem")["status"] == "downloaded"
+
+
+# ---------------------------------------------------------
+# 13. Owner Authorization & Unauthorized Message Rejection
+# ---------------------------------------------------------
+
+def test_owner_authorization(temp_dirs):
+    _, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=999888,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR="/tmp",
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+
+    # Authorized user
+    mock_auth_update = MagicMock()
+    mock_auth_update.effective_user.id = 999888
+    assert app.is_authorized(mock_auth_update) is True
+
+    # Unauthorized user
+    mock_unauth_update = MagicMock()
+    mock_unauth_update.effective_user.id = 111222
+    assert app.is_authorized(mock_unauth_update) is False

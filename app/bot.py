@@ -43,14 +43,15 @@ URL_REGEX = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 class File2URLProvider:
     """Serialized single-worker provider for large Telegram files via Bot-to-Bot forward.
 
-    Architectural Note on Correlation:
-    The third-party bot (@File2url_rbot) does not mirror custom tracking tokens or
-    job IDs in its URL responses. In our single-worker architecture, transfers
-    are serialized so exactly one File2URL exchange is active at any point in time.
-    To enforce strict safety:
-    1. Only the active job currently registered may claim a response.
-    2. Stale or unsolicited responses arriving when no job is awaiting are immediately dropped.
-    3. Timeouts and cancellations unregister and clean up the active waiter immediately.
+    Architectural Invariant on Correlation:
+    The third-party bot (@File2url_rbot) communicates in standard Telegram messages
+    and does NOT echo back private job tokens or correlation tags.
+    In this architecture:
+    1. Only ONE File2URL exchange is ever active at any given moment.
+    2. A registration assigns an active future bound to the specific job_id.
+    3. Unsolicited or late incoming messages arriving when no active waiter is present are discarded.
+    4. Cancellation and timeouts immediately clean up and unregister the waiter, preventing
+       subsequent jobs from receiving stale responses.
     """
 
     def __init__(self, bot_username: str, timeout: int = 120):
@@ -62,7 +63,6 @@ class File2URLProvider:
 
     async def register_waiter(self, job_id: str) -> asyncio.Future[str]:
         async with self._lock:
-            # If an older waiter lingered, cancel it cleanly
             if self._current_waiter and not self._current_waiter.done():
                 self._current_waiter.cancel()
             loop = asyncio.get_running_loop()
@@ -78,7 +78,6 @@ class File2URLProvider:
                 self._current_waiter = None
                 self._current_job_id = None
                 return True
-            # Dropped unsolicited/stale response
             return False
 
     async def cancel_waiter(self, job_id: str) -> None:
@@ -177,7 +176,6 @@ class TelegramDriveBotApp:
             await update.effective_message.reply_text(f"المهمة في حالة نهائية بالفعل ({current_status}).")
             return
 
-        # Set cancellation event if active
         event = self.cancel_events.get(job_id)
         if event:
             event.set()
@@ -282,7 +280,7 @@ class TelegramDriveBotApp:
                 job = await self.queue.get()
                 job_id = job["id"]
 
-                # Check fresh persisted status before running (protects cancelled queued jobs)
+                # Fresh state check before executing (skips jobs cancelled while queued)
                 current_job = self.state.get_job(job_id)
                 if not current_job or current_job.get("status") == "cancelled":
                     logger.info("Job %s was cancelled while queued; skipping worker execution.", job_id)
@@ -327,7 +325,7 @@ class TelegramDriveBotApp:
         try:
             loop = asyncio.get_running_loop()
 
-            # If recovering a job that already completed download, skip re-downloading
+            # Skip download if recovering a job whose local staging is already fully intact
             skip_download = False
             if job.get("status") == "downloaded" and temp_file_path and os.path.exists(temp_file_path):
                 try:
@@ -379,7 +377,6 @@ class TelegramDriveBotApp:
                     self.config.MAX_RETRIES,
                 )
 
-                # Pre-finalization hash
                 sha256_val, _ = hash_file(temp_file_path)
                 self.state.update_job(
                     job_id,
@@ -424,7 +421,6 @@ class TelegramDriveBotApp:
                 await self.application.bot.send_message(chat_id=chat_id, text=f"❌ خطأ غير متوقع في المهمة {job_id}: {exc}")
         finally:
             if temp_file_path and os.path.exists(temp_file_path):
-                # Only remove staging if completed, failed, or cancelled
                 fresh_status = (self.state.get_job(job_id) or {}).get("status")
                 if fresh_status in {"completed", "failed", "cancelled"}:
                     try:
@@ -433,12 +429,10 @@ class TelegramDriveBotApp:
                         pass
 
     def restore_unfinished(self) -> None:
-        """Deterministically restore incomplete jobs on startup without bypassing state rules."""
-        # 1. Clean orphan partial files in Drive destination
+        """Deterministically restore incomplete jobs on startup without violating state machine."""
         dest_dir = self.config.DRIVE_DESTINATION
         clean_orphan_drive_partials(dest_dir, self.state)
 
-        # 2. Process active jobs
         unfinished = self.state.unfinished_jobs()
         logger.info("Restoring %d unfinished jobs from state.", len(unfinished))
 
@@ -448,7 +442,6 @@ class TelegramDriveBotApp:
             temp_path = job.get("temp_path")
 
             if status in {"queued", "downloading"}:
-                # Downloading was interrupted; discard partial staging if exists
                 if temp_path and os.path.exists(temp_path):
                     try:
                         os.remove(temp_path)
@@ -458,24 +451,19 @@ class TelegramDriveBotApp:
                 self.queue.put_nowait(self.state.get_job(job_id))
 
             elif status == "downloaded":
-                # Staged file check
                 if temp_path and os.path.exists(temp_path):
                     try:
                         v_sha, v_size = hash_file(temp_path)
                         if v_size > 0 and (not job.get("sha256") or job.get("sha256") == v_sha):
-                            # Retain downloaded state and continue to Drive
                             self.state.recover_job(job_id, "downloaded", sha256=v_sha, size=v_size)
                             self.queue.put_nowait(self.state.get_job(job_id))
                             continue
                     except Exception:
                         pass
-                # Temp missing or corrupt -> restart
                 self.state.recover_job(job_id, "queued", temp_path=None)
                 self.queue.put_nowait(self.state.get_job(job_id))
 
             elif status == "verifying":
-                # Interrupted during Drive copy/verify:
-                # Check if Drive partial exists
                 target_fname = safe_filename(job.get("filename", f"file_{job_id}.bin"))
                 dest_part_path = os.path.join(dest_dir, f".part_{job_id}_{target_fname}")
                 if os.path.exists(dest_part_path):
@@ -484,7 +472,6 @@ class TelegramDriveBotApp:
                     except OSError:
                         pass
 
-                # If local temp staging still intact, recover to downloaded
                 if temp_path and os.path.exists(temp_path):
                     try:
                         v_sha, v_size = hash_file(temp_path)
@@ -495,7 +482,6 @@ class TelegramDriveBotApp:
                     except Exception:
                         pass
 
-                # Otherwise restart safely from queued
                 self.state.recover_job(job_id, "queued", temp_path=None)
                 self.queue.put_nowait(self.state.get_job(job_id))
 
