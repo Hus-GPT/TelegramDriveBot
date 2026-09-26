@@ -52,7 +52,7 @@ In the left sidebar of Google Colab, open **Secrets** (key icon) and set:
   * Invariant: exactly one File2URL exchange is active at any time; unsolicited or late messages are safely discarded. Note that `@File2url_rbot` does not echo private job tokens; correlation is achieved strictly via serialized single-worker execution.
 * **Google Drive FUSE Filesystem Caveats:**
   * Google Drive mounted via `google.colab.drive.mount` utilizes a userspace FUSE filesystem layer over Google Drive APIs.
-  * While `os.replace` operates atomically on local POSIX filesystems, FUSE remote mounts may implement file renaming via multi-step API calls.
+  * While `os.replace` operates atomically on local POSIX filesystems, FUSE remote mounts may implement file renaming via multi-step API calls. Therefore, universal transactional/atomic promotion guarantees cannot be assumed across FUSE mounts.
   * To guarantee safety across network drops or Colab kernel deaths on FUSE mounts, the engine employs a defense-in-depth model:
     1. Writes to a hidden job-tagged file (`.part_<job_id>_*`).
     2. Recalculates full SHA-256 and byte-size on the destination `.part` file.
