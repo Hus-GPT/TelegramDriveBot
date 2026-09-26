@@ -10,10 +10,11 @@ import threading
 import uuid
 from typing import Any, Dict, List, Optional
 
-from telegram import Update
+from telegram import CallbackQuery, Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -36,7 +37,14 @@ from app.transfer import (
     validate_destination_directory,
     validate_url_security,
 )
-from app.ui import ProgressTracker, format_bytes, humanize_error
+from app.ui import (
+    ProgressTracker,
+    build_confirmation_keyboard,
+    build_job_action_keyboard,
+    build_main_keyboard,
+    format_bytes,
+    humanize_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +112,12 @@ class TelegramDriveBotApp:
 
     async def check_auth_or_reject(self, update: Update) -> bool:
         if not self.is_authorized(update):
-            if update.effective_message:
+            if update.callback_query:
+                try:
+                    await update.callback_query.answer("⛔ هذا البوت شخصي وخاص بالمالك فقط.", show_alert=True)
+                except Exception:
+                    pass
+            elif update.effective_message:
                 await update.effective_message.reply_text("⛔ عذراً، هذا البوت شخصي وخاص بالمالك فقط.")
             return False
         return True
@@ -119,7 +132,14 @@ class TelegramDriveBotApp:
         await self.queue.put(job)
         return True
 
-    async def safe_edit_text(self, chat_id: int, message_id: int, text: str, parse_mode: str = "Markdown") -> bool:
+    async def safe_edit_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        parse_mode: str = "Markdown",
+        reply_markup: Optional[Any] = None,
+    ) -> bool:
         """Safely edit a message, gracefully ignoring errors to prevent UI failures from stopping transfers."""
         if not self.application:
             return False
@@ -129,6 +149,7 @@ class TelegramDriveBotApp:
                 message_id=message_id,
                 text=text,
                 parse_mode=parse_mode,
+                reply_markup=reply_markup,
             )
             return True
         except Exception as exc:
@@ -136,97 +157,11 @@ class TelegramDriveBotApp:
             return False
 
     # ---------------------------------------------------------
-    # Command Handlers
+    # Reusable Presentation Methods
     # ---------------------------------------------------------
 
-    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self.check_auth_or_reject(update):
-            return
-
-        dest_name = os.path.basename(self.config.DRIVE_DESTINATION)
-        active_cnt = len(self.active_jobs)
-        queue_cnt = self.queue.qsize()
-
-        msg = (
-            "🤖 *TelegramDriveBot — مدير النقل المباشر*\n\n"
-            "الحالة: جاهز ومستعد لاستقبال الملفات والروابط.\n"
-            f"📁 مجلد الوجهة: `.../{dest_name}`\n"
-            f"⚡ العمليات الجارية: {active_cnt} | ⏳ في الانتظار: {queue_cnt}\n\n"
-            "📥 *طريقة الاستخدام:*\n"
-            "• أرسل أي رابط تحميل مباشر (`https://...`)\n"
-            "• أرسل أي ملف، فيديو، مستند، أو صوت عبر تيليجرام\n\n"
-            "📋 *الأوامر التشغيلية:*\n"
-            "/status — عرض حالة النقل الحالية أو تفاصيل مهمة محددة (`/status <معرّف>`)\n"
-            "/storage — تشخيص حالة التخزين ومجلد Google Drive\n"
-            "/history — استعراض أحدث المهام المكتملة والفاشلة\n"
-            "/cancel — إلغاء العملية الجارية، أو `/cancel <معرّف>`\n"
-            "/retry <معرّف> — إعادة تشغيل مهمة فاشلة أو ملغاة\n"
-            "/help — قائمة التعليمات والأوامر"
-        )
-        await update.effective_message.reply_text(msg, parse_mode="Markdown")
-
-    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self.check_auth_or_reject(update):
-            return
-
-        msg = (
-            "📖 *دليل أوامر TelegramDriveBot:*\n\n"
-            "• `/status` : تقرير شامل عن العمليات النشطة، طابور الانتظار، وإحصائيات النقل.\n"
-            "• `/status <معرّف>` : عرض التفاصيل الكاملة لمهمة محددة (أوقاتها، البصمة، المسار، الخطأ).\n"
-            "• `/storage` : فحص حالة تثبيت Google Drive وصلاحية الكتابة ومساحة Staging المحلية.\n"
-            "• `/history` : عرض سجل بآخر العمليات المنتهية (الناجحة والفاشلة).\n"
-            "• `/cancel` : إلغاء العملية الجارية فوراً.\n"
-            "• `/cancel <معرّف>` : إلغاء مهمة محددة بالاسم (سواء جارية أو بقائمة الانتظار).\n"
-            "• `/retry <معرّف>` : إعادة جدولة مهمة فاشلة أو ملغاة بدون إعادة إرسال الرابط.\n"
-            "• `/start` : رسالة الترحيب وملخص النظام.\n\n"
-            "💡 *ملاحظة:* الملفات التي تزيد عن 20 ميجابايت يتم تحويلها تلقائياً عبر خدمة File2URL."
-        )
-        await update.effective_message.reply_text(msg, parse_mode="Markdown")
-
-    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self.check_auth_or_reject(update):
-            return
-
-        args = context.args or []
-        if args:
-            # Job Detail Mode: /status <job_id>
-            job_id = args[0].strip()
-            job = self.state.get_job(job_id)
-            if not job:
-                await update.effective_message.reply_text(f"❓ لم يتم العثور على مهمة بالمعرّف `{job_id}`.")
-                return
-
-            st = job.get("status")
-            fname = job.get("filename", "بدون اسم")
-            sz = format_bytes(job.get("size"))
-            created = job.get("created_at", "--")
-            started = job.get("started_at") or "--"
-            completed = job.get("completed_at") or "--"
-            sha = job.get("sha256") or "لم تُحسب بعد"
-            err = job.get("error")
-            retries = job.get("retries", 0)
-            dest = job.get("destination_path") or "غير محدد بعد"
-
-            detail = (
-                f"📋 *تفاصيل المهمة:* `{job_id}`\n\n"
-                f"• الملف: `{fname}`\n"
-                f"• الحالة: `{st}`\n"
-                f"• الحجم: {sz}\n"
-                f"• نوع المصدر: `{job.get('source_type')}`\n"
-                f"• عدد المحاولات: {retries}\n"
-                f"• تاريخ الإنشاء: `{created}`\n"
-                f"• تاريخ البدء: `{started}`\n"
-                f"• تاريخ الانتهاء: `{completed}`\n"
-                f"• مسار الوجهة: `{dest}`\n"
-                f"• البصمة المشفرة (SHA-256): `{sha}`\n"
-            )
-            if err:
-                detail += f"• الخطأ المسجل: `{err}`\n"
-
-            await update.effective_message.reply_text(detail, parse_mode="Markdown")
-            return
-
-        # Overall Status Overview
+    def render_status_text(self) -> str:
+        """Construct system operational status overview."""
         jobs = self.state.all_jobs()
         active = [j for j in jobs if j.get("status") in {"queued", "downloading", "downloaded", "verifying"}]
         stats = self.state.data.get("stats", {})
@@ -260,20 +195,47 @@ class TelegramDriveBotApp:
         if not active:
             report += "✨ لا توجد عمليات جارية حالياً."
 
-        await update.effective_message.reply_text(report, parse_mode="Markdown")
+        return report
 
-    async def cmd_storage(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Operational storage diagnostics command (Milestone 4)."""
-        if not await self.check_auth_or_reject(update):
-            return
+    def render_job_detail_text(self, job: Dict[str, Any]) -> str:
+        """Construct detailed metadata view for a specific job."""
+        job_id = job.get("id")
+        st = job.get("status")
+        fname = job.get("filename", "بدون اسم")
+        sz = format_bytes(job.get("size"))
+        created = (job.get("created_at") or "--")[:19].replace("T", " ")
+        started = (job.get("started_at") or "--")[:19].replace("T", " ")
+        completed = (job.get("completed_at") or "--")[:19].replace("T", " ")
+        sha = job.get("sha256") or "لم تُحسب بعد"
+        err = job.get("error")
+        retries = job.get("retries", 0)
+        dest = job.get("destination_path") or "غير محدد بعد"
 
+        detail = (
+            f"📋 *تفاصيل المهمة:* `{job_id}`\n\n"
+            f"• الملف: `{fname}`\n"
+            f"• الحالة: `{st}`\n"
+            f"• الحجم: {sz}\n"
+            f"• نوع المصدر: `{job.get('source_type')}`\n"
+            f"• عدد المحاولات: {retries}\n"
+            f"• تاريخ الإنشاء: `{created}`\n"
+            f"• تاريخ البدء: `{started}`\n"
+            f"• تاريخ الانتهاء: `{completed}`\n"
+            f"• مسار الوجهة: `{dest}`\n"
+            f"• البصمة (SHA-256): `{sha}`\n"
+        )
+        if err:
+            detail += f"• الخطأ المسجل: `{err}`\n"
+        return detail
+
+    def render_storage_text(self) -> str:
+        """Construct storage diagnostics overview."""
         diag = get_storage_diagnostics(self.config.LOCAL_STAGING_DIR, self.config.DRIVE_DESTINATION)
-
         mount_status = "✅ متصل (Mounted)" if diag.is_mount_likely else "⚠️ غير مؤكد أو غير متصل"
         drive_write = "✅ متاح للكتابة" if diag.drive_writable else "❌ غير متاح للكتابة أو محمي"
         stg_free_str = format_bytes(diag.staging_free_bytes)
 
-        report = (
+        return (
             "💽 *تشخيص وسائط التخزين (Storage Intelligence)*\n\n"
             "☁️ *Google Drive Destination:*\n"
             f"• المسار: `{diag.drive_path}`\n"
@@ -285,21 +247,16 @@ class TelegramDriveBotApp:
             f"• الحد الأقصى المسموح للملف: `{format_bytes(self.config.MAX_DOWNLOAD_SIZE)}`\n\n"
             "💡 *ملاحظة:* سعة Google Drive السحابية تُدار عبر حسابك وليست قرصاً محلياً مباشراً."
         )
-        await update.effective_message.reply_text(report, parse_mode="Markdown")
 
-    async def cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self.check_auth_or_reject(update):
-            return
-
+    def render_history_text(self) -> str:
+        """Construct recent completed/failed history overview."""
         limit = self.config.STATUS_HISTORY_COUNT
         all_jobs = self.state.all_jobs()
         terminal_jobs = [j for j in all_jobs if j.get("status") in {"completed", "failed", "cancelled"}]
 
         if not terminal_jobs:
-            await update.effective_message.reply_text("📂 سجل المهام فارغ حتى الآن.")
-            return
+            return "📂 سجل المهام فارغ حتى الآن."
 
-        # Order chronologically descending (newest first)
         terminal_jobs.sort(key=lambda x: x.get("completed_at") or x.get("updated_at") or "", reverse=True)
         recent = terminal_jobs[:limit]
 
@@ -311,9 +268,108 @@ class TelegramDriveBotApp:
             j_id = j.get("id")
             sz = format_bytes(j.get("size"))
             time_str = (j.get("completed_at") or j.get("updated_at") or "")[:19].replace("T", " ")
-            text += f"{icon} `{j_id}` : `{fname}` ({sz})\n   الحالة: {st} | الوقت: {time_str}\n"
+            text += f"{icon} `/status_{j_id}`\n   📄 `{fname}` ({sz})\n   الحالة: {st} | الوقت: {time_str}\n\n"
 
+        return text
+
+    # ---------------------------------------------------------
+    # Command Handlers
+    # ---------------------------------------------------------
+
+    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_auth_or_reject(update):
+            return
+
+        dest_name = os.path.basename(self.config.DRIVE_DESTINATION)
+        active_cnt = len(self.active_jobs)
+        queue_cnt = self.queue.qsize()
+
+        msg = (
+            "🤖 *TelegramDriveBot — مدير النقل المباشر*\n\n"
+            "الحالة: جاهز ومستعد لاستقبال الملفات والروابط.\n"
+            f"📁 مجلد الوجهة: `.../{dest_name}`\n"
+            f"⚡ العمليات الجارية: {active_cnt} | ⏳ في الانتظار: {queue_cnt}\n\n"
+            "📥 *طريقة الاستخدام:*\n"
+            "• أرسل أي رابط تحميل مباشر (`https://...`)\n"
+            "• أرسل أي ملف، فيديو، مستند، أو صوت عبر تيليجرام\n\n"
+            "🔘 يمكنك استخدام لوحة التحكم السريعة أدناه أو كتابة الأوامر مباشرة:"
+        )
+        await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=build_main_keyboard())
+
+    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_auth_or_reject(update):
+            return
+
+        msg = (
+            "📖 *دليل أوامر TelegramDriveBot:*\n\n"
+            "• `/status` : تقرير شامل عن العمليات النشطة وطابور الانتظار.\n"
+            "• `/status <معرّف>` : تفاصيل المهمة الدقيقة مع أزرار التحكم بها.\n"
+            "• `/storage` : فحص اتصال Google Drive وصلاحية الكتابة ومساحة Staging.\n"
+            "• `/history` : عرض سجل بآخر العمليات المنتهية.\n"
+            "• `/cancel` : إلغاء العملية الجارية فوراً.\n"
+            "• `/cancel <معرّف>` : إلغاء مهمة محددة بالاسم.\n"
+            "• `/retry <معرّف>` : إعادة جدولة مهمة فاشلة أو ملغاة.\n"
+            "• `/start` : رسالة الترحيب ولوحة التحكم السريعة.\n\n"
+            "💡 *ملاحظة:* الملفات الأكبر من 20 ميجابايت تُحوّل تلقائياً عبر File2URL."
+        )
+        await update.effective_message.reply_text(msg, parse_mode="Markdown")
+
+    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_auth_or_reject(update):
+            return
+
+        args = context.args or []
+        if args:
+            job_id = args[0].strip().lstrip("_")
+            job = self.state.get_job(job_id)
+            if not job:
+                await update.effective_message.reply_text(f"❓ لم يتم العثور على مهمة بالمعرّف `{job_id}`.")
+                return
+
+            detail = self.render_job_detail_text(job)
+            kb = build_job_action_keyboard(job_id, job.get("status", ""))
+            await update.effective_message.reply_text(detail, parse_mode="Markdown", reply_markup=kb)
+            return
+
+        report = self.render_status_text()
+        await update.effective_message.reply_text(report, parse_mode="Markdown")
+
+    async def cmd_storage(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_auth_or_reject(update):
+            return
+        report = self.render_storage_text()
+        await update.effective_message.reply_text(report, parse_mode="Markdown")
+
+    async def cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_auth_or_reject(update):
+            return
+        text = self.render_history_text()
         await update.effective_message.reply_text(text, parse_mode="Markdown")
+
+    async def execute_cancel_job(self, job_id: str) -> Tuple[bool, str]:
+        """Perform logical cancellation safely and return (success, message)."""
+        job = self.state.get_job(job_id)
+        if not job:
+            return False, f"❓ لم يتم العثور على مهمة بالمعرّف `{job_id}`."
+
+        current_status = job.get("status")
+        if current_status == "completed":
+            return False, f"⚠️ المهمة `{job_id}` مكتملة بالفعل ولا يمكن إلغاؤها."
+        if current_status in {"failed", "cancelled"}:
+            return False, f"ℹ️ المهمة `{job_id}` في حالة منتهية بالفعل ({current_status})."
+
+        event = self.cancel_events.get(job_id)
+        if event:
+            event.set()
+        await self.file2url.cancel_waiter(job_id)
+        self.queued_ids.discard(job_id)
+
+        try:
+            self.state.update_job(job_id, status="cancelled", error="تم الإلغاء بواسطة المستخدم")
+            logger.info("[job=%s] Cancelled successfully.", job_id)
+            return True, f"🚫 تم إلغاء المهمة `{job_id}` بنجاح."
+        except Exception as exc:
+            return False, f"تعذر تحديث حالة الإلغاء: {exc}"
 
     async def cmd_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self.check_auth_or_reject(update):
@@ -323,7 +379,7 @@ class TelegramDriveBotApp:
         job_id: Optional[str] = None
 
         if args:
-            job_id = args[0].strip()
+            job_id = args[0].strip().lstrip("_")
         else:
             if self.active_jobs:
                 job_id = next(iter(self.active_jobs.keys()))
@@ -331,32 +387,33 @@ class TelegramDriveBotApp:
                 await update.effective_message.reply_text("ℹ️ لا توجد عملية نشطة حالياً لإلغائها.\nلإلغاء مهمة محددة: `/cancel <معرّف>`")
                 return
 
+        _, msg = await self.execute_cancel_job(job_id)
+        await update.effective_message.reply_text(msg, parse_mode="Markdown")
+
+    async def execute_retry_job(self, job_id: str) -> Tuple[bool, str]:
+        """Perform logical retry safely and return (success, message)."""
         job = self.state.get_job(job_id)
         if not job:
-            await update.effective_message.reply_text(f"❓ لم يتم العثور على مهمة بالمعرّف `{job_id}`.")
-            return
+            return False, f"❓ المهمة `{job_id}` غير موجودة بالسجل."
 
         current_status = job.get("status")
+        if current_status in {"queued", "downloading", "downloaded", "verifying"}:
+            return False, f"⚠️ المهمة `{job_id}` جارية أو في الانتظار بالفعل ({current_status})."
         if current_status == "completed":
-            await update.effective_message.reply_text(f"⚠️ المهمة `{job_id}` مكتملة بالفعل ولا يمكن إلغاؤها.")
-            return
-        if current_status in {"failed", "cancelled"}:
-            await update.effective_message.reply_text(f"ℹ️ المهمة `{job_id}` في حالة منتهية بالفعل ({current_status}).")
-            return
-
-        # Signal cancellation event
-        event = self.cancel_events.get(job_id)
-        if event:
-            event.set()
-        await self.file2url.cancel_waiter(job_id)
-        self.queued_ids.discard(job_id)
+            return False, f"✅ المهمة `{job_id}` مكتملة بنجاح في Google Drive بالفعل ولا تحتاج لإعادة المحاولة."
 
         try:
-            self.state.update_job(job_id, status="cancelled", error="تم الإلغاء بواسطة المستخدم")
-            logger.info("[job=%s] Cancelled via user command.", job_id)
-            await update.effective_message.reply_text(f"🚫 تم إلغاء المهمة `{job_id}` بنجاح.")
+            updated = self.state.retry_job(job_id)
+            if updated:
+                enqueued = await self.safe_enqueue_job(updated)
+                if enqueued:
+                    logger.info("[job=%s] Re-enqueued after retry command (attempt %d).", job_id, updated.get("retries", 1))
+                    return True, f"🔄 تمت إعادة جدولة المهمة `{job_id}` بنجاح (المحاولة {updated.get('retries')}).\nالملف: `{updated.get('filename')}`"
+                else:
+                    return False, f"⚠️ المهمة `{job_id}` موجودة بالفعل في صف الانتظار."
+            return False, "فشل غير متوقع أثناء تحديث السجل."
         except Exception as exc:
-            await update.effective_message.reply_text(f"تعذر تحديث حالة الإلغاء: {exc}")
+            return False, f"❌ تعذر إعادة الجدولة: {exc}"
 
     async def cmd_retry(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self.check_auth_or_reject(update):
@@ -367,33 +424,137 @@ class TelegramDriveBotApp:
             await update.effective_message.reply_text("يرجى تحديد معرّف المهمة المراد إعادة تشغيلها:\n`/retry <job_id>`")
             return
 
-        job_id = args[0].strip()
-        job = self.state.get_job(job_id)
-        if not job:
-            await update.effective_message.reply_text(f"❓ المهمة `{job_id}` غير موجودة بالسجل.")
+        job_id = args[0].strip().lstrip("_")
+        _, msg = await self.execute_retry_job(job_id)
+        await update.effective_message.reply_text(msg, parse_mode="Markdown")
+
+    # ---------------------------------------------------------
+    # Callback Query Handler (Milestone 6)
+    # ---------------------------------------------------------
+
+    async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle inline keyboard interactions safely with owner auth and state validation."""
+        query = update.callback_query
+        if not query:
             return
 
-        current_status = job.get("status")
-        if current_status in {"queued", "downloading", "downloaded", "verifying"}:
-            await update.effective_message.reply_text(f"⚠️ المهمة `{job_id}` جارية أو في الانتظار بالفعل ({current_status}).")
+        if not await self.check_auth_or_reject(update):
             return
-        if current_status == "completed":
-            await update.effective_message.reply_text(f"✅ المهمة `{job_id}` مكتملة بنجاح في Google Drive بالفعل ولا تحتاج لإعادة المحاولة.")
-            return
+
+        data = query.data or ""
+        chat_id = query.message.chat_id if query.message else None
+        msg_id = query.message.message_id if query.message else None
 
         try:
-            updated = self.state.retry_job(job_id)
-            if updated:
-                enqueued = await self.safe_enqueue_job(updated)
-                if enqueued:
-                    logger.info("[job=%s] Re-enqueued after retry command (attempt %d).", job_id, updated.get("retries", 1))
-                    await update.effective_message.reply_text(
-                        f"🔄 تمت إعادة جدولة المهمة `{job_id}` في صف الانتظار بنجاح (المحاولة {updated.get('retries')}).\nالملف: `{updated.get('filename')}`"
-                    )
-                else:
-                    await update.effective_message.reply_text(f"⚠️ المهمة `{job_id}` موجودة بالفعل في صف الانتظار.")
-        except Exception as exc:
-            await update.effective_message.reply_text(f"❌ تعذر إعادة الجدولة: {exc}")
+            await query.answer()
+        except Exception:
+            pass
+
+        # 1. Dashboard Navigation
+        if data == "nav_status":
+            text = self.render_status_text()
+            if chat_id and msg_id:
+                await self.safe_edit_text(chat_id, msg_id, text, reply_markup=build_main_keyboard())
+            return
+
+        if data == "nav_history":
+            text = self.render_history_text()
+            if chat_id and msg_id:
+                await self.safe_edit_text(chat_id, msg_id, text, reply_markup=build_main_keyboard())
+            return
+
+        if data == "nav_storage":
+            text = self.render_storage_text()
+            if chat_id and msg_id:
+                await self.safe_edit_text(chat_id, msg_id, text, reply_markup=build_main_keyboard())
+            return
+
+        if data == "nav_help":
+            help_text = (
+                "📖 *تعليمات سريعة:*\n\n"
+                "• أرسل أي رابط مباشر وسيبدأ البوت بتنزيله فوراً.\n"
+                "• لإلغاء أي مهمة: اضغط زر الإلغاء أو استخدم `/cancel <معرّف>`.\n"
+                "• لإعادة تشغيل مهمة فاشلة: استخدم `/retry <معرّف>`."
+            )
+            if chat_id and msg_id:
+                await self.safe_edit_text(chat_id, msg_id, help_text, reply_markup=build_main_keyboard())
+            return
+
+        # 2. Cancel Active Fast Action
+        if data == "act_cancel_active":
+            if self.active_jobs:
+                act_id = next(iter(self.active_jobs.keys()))
+                _, cancel_msg = await self.execute_cancel_job(act_id)
+                if query.message:
+                    await query.message.reply_text(cancel_msg, parse_mode="Markdown")
+            else:
+                if query.message:
+                    await query.message.reply_text("ℹ️ لا توجد عملية نشطة حالياً لإلغائها.")
+            return
+
+        # 3. Job Detail View: job_detail_<id>
+        if data.startswith("job_detail_"):
+            job_id = data.replace("job_detail_", "")
+            job = self.state.get_job(job_id)
+            if not job:
+                if chat_id and msg_id:
+                    await self.safe_edit_text(chat_id, msg_id, f"❓ لم يتم العثور على المهمة `{job_id}`.")
+                return
+            detail = self.render_job_detail_text(job)
+            kb = build_job_action_keyboard(job_id, job.get("status", ""))
+            if chat_id and msg_id:
+                await self.safe_edit_text(chat_id, msg_id, detail, reply_markup=kb)
+            return
+
+        # 4. Confirmation Prompts: ask_cancel_<id>, ask_retry_<id>
+        if data.startswith("ask_cancel_"):
+            job_id = data.replace("ask_cancel_", "")
+            job = self.state.get_job(job_id)
+            if not job or job.get("status") in {"completed", "failed", "cancelled"}:
+                try:
+                    await query.answer("⚠️ لا يمكن إلغاء هذه المهمة (حالتها تغيرت بالفعل).", show_alert=True)
+                except Exception:
+                    pass
+                return
+            prompt = f"⚠️ هل أنت متأكد من إلغاء المهمة `{job_id}` (`{job.get('filename')}`)؟"
+            kb = build_confirmation_keyboard("cancel", job_id)
+            if chat_id and msg_id:
+                await self.safe_edit_text(chat_id, msg_id, prompt, reply_markup=kb)
+            return
+
+        if data.startswith("ask_retry_"):
+            job_id = data.replace("ask_retry_", "")
+            job = self.state.get_job(job_id)
+            if not job or job.get("status") not in {"failed", "cancelled"}:
+                try:
+                    await query.answer("⚠️ هذه المهمة غير مؤهلة لإعادة المحاولة (حالتها تغيرت).", show_alert=True)
+                except Exception:
+                    pass
+                return
+            prompt = f"🔄 هل ترغب في إعادة جدولة المهمة `{job_id}` في طابور الانتظار؟"
+            kb = build_confirmation_keyboard("retry", job_id)
+            if chat_id and msg_id:
+                await self.safe_edit_text(chat_id, msg_id, prompt, reply_markup=kb)
+            return
+
+        # 5. Executing Actions: do_cancel_<id>, do_retry_<id>
+        if data.startswith("do_cancel_"):
+            job_id = data.replace("do_cancel_", "")
+            _, cancel_msg = await self.execute_cancel_job(job_id)
+            job = self.state.get_job(job_id)
+            kb = build_job_action_keyboard(job_id, job.get("status", "")) if job else None
+            if chat_id and msg_id:
+                await self.safe_edit_text(chat_id, msg_id, cancel_msg, reply_markup=kb)
+            return
+
+        if data.startswith("do_retry_"):
+            job_id = data.replace("do_retry_", "")
+            _, retry_msg = await self.execute_retry_job(job_id)
+            job = self.state.get_job(job_id)
+            kb = build_job_action_keyboard(job_id, job.get("status", "")) if job else None
+            if chat_id and msg_id:
+                await self.safe_edit_text(chat_id, msg_id, retry_msg, reply_markup=kb)
+            return
 
     # ---------------------------------------------------------
     # Input Handling (Media & URLs)
@@ -416,7 +577,17 @@ class TelegramDriveBotApp:
             return
 
         message = update.effective_message
-        text = message.text or message.caption or ""
+        text = (message.text or message.caption or "").strip()
+
+        # Check for shorthand deep-link status command: /status_jobid
+        if text.startswith("/status_"):
+            job_id = text.replace("/status_", "").strip()
+            job = self.state.get_job(job_id)
+            if job:
+                detail = self.render_job_detail_text(job)
+                kb = build_job_action_keyboard(job_id, job.get("status", ""))
+                await message.reply_text(detail, parse_mode="Markdown", reply_markup=kb)
+                return
 
         # Direct URL check
         url_match = URL_REGEX.search(text)
@@ -437,6 +608,7 @@ class TelegramDriveBotApp:
                 f"• المعرّف: `{job_id}`\n"
                 f"• الملف المتوقع: `{fname}`",
                 parse_mode="Markdown",
+                reply_markup=build_job_action_keyboard(job_id, "queued"),
             )
 
             job = self.state.add_job(
@@ -470,6 +642,7 @@ class TelegramDriveBotApp:
                 f"• الاسم: `{file_name}`\n"
                 f"• الحجم: {sz_str}",
                 parse_mode="Markdown",
+                reply_markup=build_job_action_keyboard(job_id, "queued"),
             )
 
             job = self.state.add_job(
@@ -490,6 +663,7 @@ class TelegramDriveBotApp:
             "ℹ️ لم يتم التعرف على المدخل.\n"
             "يرجى إرسال رابط مباشر يبدأ بـ `http://` أو `https://`، أو ملف/مستند/فيديو مباشرة، أو استخدام `/help` لعرض الأوامر.",
             parse_mode="Markdown",
+            reply_markup=build_main_keyboard(),
         )
 
     # ---------------------------------------------------------
@@ -574,6 +748,7 @@ class TelegramDriveBotApp:
                         chat_id,
                         ui_msg_id,
                         f"⚡ *بدء تنزيل الملف:* `{resolved_name}`\n• المعرّف: `{job_id}`\n• جاري الاتصال بالخادم المصدر...",
+                        reply_markup=build_job_action_keyboard(job_id, "downloading"),
                     )
 
                 download_link: Optional[str] = None
@@ -588,6 +763,7 @@ class TelegramDriveBotApp:
                             chat_id,
                             ui_msg_id,
                             f"🔄 جاري تحويل الملف الكبير عبر خدمة File2URL...\n• المعرّف: `{job_id}`",
+                            reply_markup=build_job_action_keyboard(job_id, "downloading"),
                         )
 
                     waiter = await self.file2url.register_waiter(job_id)
@@ -617,7 +793,12 @@ class TelegramDriveBotApp:
                     if ui_msg_id and tracker.should_update(bytes_written, total_expected):
                         prog_text = tracker.build_progress_text(bytes_written, total_expected)
                         asyncio.run_coroutine_threadsafe(
-                            self.safe_edit_text(chat_id, ui_msg_id, prog_text),
+                            self.safe_edit_text(
+                                chat_id,
+                                ui_msg_id,
+                                prog_text,
+                                reply_markup=build_job_action_keyboard(job_id, "downloading"),
+                            ),
                             loop,
                         )
 
@@ -657,6 +838,7 @@ class TelegramDriveBotApp:
                     f"☁️ *جاري الحفظ في Google Drive:*\n"
                     f"• الملف: `{resolved_name}`\n"
                     f"• المرحلة: فحص وتأكيد سلامة التشفير (SHA-256)...",
+                    reply_markup=build_job_action_keyboard(job_id, "verifying"),
                 )
 
             result = await loop.run_in_executor(
@@ -683,15 +865,16 @@ class TelegramDriveBotApp:
                 f"📦 الحجم: {size_formatted}\n"
                 f"🔐 البصمة: SHA-256 مطابقة وموثقة\n"
                 f"📁 المسار: `.../{os.path.basename(dest_dir)}/{final_name}`\n"
-                f"🆔 المعرّف: `{job_id}`"
+                f"🆔 المعرّف: `/status_{job_id}`"
             )
 
+            kb = build_job_action_keyboard(job_id, "completed")
             if ui_msg_id:
-                edited = await self.safe_edit_text(chat_id, ui_msg_id, completion_msg)
+                edited = await self.safe_edit_text(chat_id, ui_msg_id, completion_msg, reply_markup=kb)
                 if not edited:
-                    await self.application.bot.send_message(chat_id=chat_id, text=completion_msg, parse_mode="Markdown")
+                    await self.application.bot.send_message(chat_id=chat_id, text=completion_msg, parse_mode="Markdown", reply_markup=kb)
             else:
-                await self.application.bot.send_message(chat_id=chat_id, text=completion_msg, parse_mode="Markdown")
+                await self.application.bot.send_message(chat_id=chat_id, text=completion_msg, parse_mode="Markdown", reply_markup=kb)
 
         except NonRetryableTransferError as exc:
             fresh_status = (self.state.get_job(job_id) or {}).get("status")
@@ -705,10 +888,11 @@ class TelegramDriveBotApp:
                     f"• الملف: `{resolved_name}`\n\n"
                     f"💡 للإعادة بعد تصحيح الخلل: `/retry {job_id}`"
                 )
+                kb = build_job_action_keyboard(job_id, "failed")
                 if ui_msg_id:
-                    await self.safe_edit_text(chat_id, ui_msg_id, err_text)
+                    await self.safe_edit_text(chat_id, ui_msg_id, err_text, reply_markup=kb)
                 else:
-                    await self.application.bot.send_message(chat_id=chat_id, text=err_text, parse_mode="Markdown")
+                    await self.application.bot.send_message(chat_id=chat_id, text=err_text, parse_mode="Markdown", reply_markup=kb)
 
         except Exception as exc:
             fresh_status = (self.state.get_job(job_id) or {}).get("status")
@@ -722,10 +906,11 @@ class TelegramDriveBotApp:
                     f"• الملف: `{resolved_name}`\n\n"
                     f"💡 يمكنك إعادة المحاولة عبر: `/retry {job_id}`"
                 )
+                kb = build_job_action_keyboard(job_id, "failed")
                 if ui_msg_id:
-                    await self.safe_edit_text(chat_id, ui_msg_id, err_text)
+                    await self.safe_edit_text(chat_id, ui_msg_id, err_text, reply_markup=kb)
                 else:
-                    await self.application.bot.send_message(chat_id=chat_id, text=err_text, parse_mode="Markdown")
+                    await self.application.bot.send_message(chat_id=chat_id, text=err_text, parse_mode="Markdown", reply_markup=kb)
 
         finally:
             if temp_file_path and os.path.exists(temp_file_path):
@@ -816,5 +1001,6 @@ class TelegramDriveBotApp:
         self.application.add_handler(CommandHandler("history", self.cmd_history))
         self.application.add_handler(CommandHandler("cancel", self.cmd_cancel))
         self.application.add_handler(CommandHandler("retry", self.cmd_retry))
+        self.application.add_handler(CallbackQueryHandler(self.handle_callback_query))
         self.application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.handle_message))
         return self.application

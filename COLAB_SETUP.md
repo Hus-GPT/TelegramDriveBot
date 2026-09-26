@@ -31,15 +31,27 @@ In the left sidebar of Google Colab, open **Secrets** (key icon) and set:
 * `TELEGRAM_BOT_TOKEN`: The API token from `@BotFather`.
 * `OWNER_ID`: Your numerical Telegram user ID (from `@userinfobot`).
 
-## Operational Commands (Milestones 2, 3, 4 & 5)
+## Operational Commands & Mobile UX (Milestones 2–6)
 
+* `/start` : Mobile dashboard with Quick Inline Controls (Status, History, Storage, Cancel, Help).
 * `/status` : View real-time bot state, active job, queue count, and transfer metrics.
-* `/status <job_id>` : Inspect full lifecycle metadata, timestamps, hash, and path for a specific job.
+* `/status <job_id>` : Inspect full lifecycle metadata, timestamps, hash, and interactive action buttons for a specific job.
 * `/storage` : View storage diagnostics (Google Drive destination writability, mount status, local staging disk capacity).
-* `/history` : Review recent completed, failed, and cancelled transfer history chronologically.
+* `/history` : Review recent completed, failed, and cancelled transfer history chronologically with `/status_<id>` links.
 * `/cancel` : Safely cancel the currently active transfer, or specify a job ID via `/cancel <job_id>`.
 * `/retry <job_id>` : Requeue failed or cancelled transfers with original metadata (increments retry count).
 * `/help` : View available commands and operational notes.
+
+## Interactive Owner Control Surface (Milestone 6)
+
+* **Mobile Quick Controls:** The `/start` command provides a clean Inline Keyboard (`📊 الحالة`, `📜 السجل`, `💾 التخزين`, `❌ إلغاء الجارية`, `📖 المساعدة`).
+* **State-Aware Job Controls:** Dynamic inline buttons on job inspection and lifecycle messages:
+  * `queued` / `downloading` $\to$ `[❌ تأكيد الإلغاء]`
+  * `failed` / `cancelled` $\to$ `[🔁 إعادة المحاولة]`
+  * `completed` $\to$ `[ℹ️ معلومات تفصيلية]`
+* **Two-Step Confirmation UX:** Destructive actions (`cancel`, `retry`) display immediate one-tap confirmation prompts (`نعم` / `تراجع`), preventing accidental taps on mobile.
+* **Stale Button Protection:** Callbacks validate live status in `StateStore` before executing. Tapping obsolete buttons (e.g. Cancel on a completed job) displays an alert without corrupting state.
+* **Complete Authorization Guard:** All callback queries, commands, and messages verify `update.effective_user.id == config.OWNER_ID` upfront.
 
 ## Hardened Download Engine (Milestone 3)
 

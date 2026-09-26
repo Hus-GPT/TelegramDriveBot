@@ -1,4 +1,4 @@
-"""Comprehensive automated test suite for TelegramDriveBot Core Reliability, UX & Milestone 5 Advanced Job Manager."""
+"""Comprehensive automated test suite for TelegramDriveBot Core Reliability, UX & Milestone 6 Owner Controls."""
 
 import asyncio
 import hashlib
@@ -27,7 +27,15 @@ from app.transfer import (
     validate_url_security,
 )
 from app.bot import File2URLProvider, TelegramDriveBotApp
-from app.ui import ProgressTracker, format_bytes, format_duration, humanize_error
+from app.ui import (
+    ProgressTracker,
+    build_confirmation_keyboard,
+    build_job_action_keyboard,
+    build_main_keyboard,
+    format_bytes,
+    format_duration,
+    humanize_error,
+)
 
 
 @pytest.fixture
@@ -631,7 +639,6 @@ async def test_cmd_start_and_help(temp_dirs):
     update.effective_message.reply_text.assert_called_once()
     start_reply = update.effective_message.reply_text.call_args[0][0]
     assert "TelegramDriveBot" in start_reply
-    assert "/status" in start_reply
 
     update.effective_message.reply_text.reset_mock()
     await app.cmd_help(update, context)
@@ -974,9 +981,9 @@ async def test_cmd_storage(temp_dirs):
     assert "Local Staging" in msg
 
 
-# =========================================================
-# MILESTONE 5: Advanced Job Manager Tests
-# =========================================================
+# ---------------------------------------------------------
+# 12. Advanced Job Manager Tests (Milestone 5)
+# ---------------------------------------------------------
 
 def test_job_metadata_lifecycle_timestamps(temp_dirs):
     _, drive = temp_dirs
@@ -1000,10 +1007,8 @@ def test_job_metadata_lifecycle_timestamps(temp_dirs):
 
 def test_state_retention_preserves_active_jobs(temp_dirs):
     _, drive = temp_dirs
-    # Configure tight max_history of 50
     store = StateStore(os.path.join(drive, "state.json"), max_history=50)
 
-    # Add 55 completed jobs
     for i in range(55):
         j_id = f"c_{i}"
         store.add_job(j_id, "direct_url", f"file_{i}.bin", 1, 2)
@@ -1012,16 +1017,13 @@ def test_state_retention_preserves_active_jobs(temp_dirs):
         store.update_job(j_id, status="verifying")
         store.update_job(j_id, status="completed")
 
-    # Add 2 active queued jobs
     store.add_job("active_1", "direct_url", "a1.bin", 1, 2)
     store.add_job("active_2", "direct_url", "a2.bin", 1, 2)
 
-    # Active jobs must NEVER be pruned
     all_j = store.all_jobs()
     ids = {j["id"] for j in all_j}
     assert "active_1" in ids
     assert "active_2" in ids
-    # Oldest completed jobs should have been pruned to keep under limit
     assert "c_0" not in ids
     assert "c_54" in ids
 
@@ -1040,12 +1042,10 @@ async def test_queue_duplicate_enqueue_prevention(temp_dirs):
 
     job = app.state.add_job("j_dup_q", "direct_url", "dup.bin", 777, 777)
 
-    # First enqueue succeeds
     first = await app.safe_enqueue_job(job)
     assert first is True
     assert app.queue.qsize() == 1
 
-    # Second enqueue of identical job ID is rejected
     second = await app.safe_enqueue_job(job)
     assert second is False
     assert app.queue.qsize() == 1
@@ -1074,7 +1074,6 @@ async def test_cmd_status_job_detail_mode(temp_dirs):
     update.effective_message.reply_text = AsyncMock()
     context = MagicMock()
 
-    # /status job_detail_1
     context.args = ["job_detail_1"]
     await app.cmd_status(update, context)
     update.effective_message.reply_text.assert_called_once()
@@ -1084,3 +1083,171 @@ async def test_cmd_status_job_detail_mode(temp_dirs):
     assert "report.pdf" in msg
     assert "abcd1234ef" in msg
     assert "completed" in msg
+
+
+# =========================================================
+# MILESTONE 6: Telegram UX & Owner Control Tests
+# =================================------------------------
+
+def test_ui_keyboards_builder():
+    main_kb = build_main_keyboard()
+    assert main_kb is not None
+    assert len(main_kb.inline_keyboard) == 2
+
+    # Active/Queued job keyboard: should have Cancel button
+    q_kb = build_job_action_keyboard("j_test", "queued")
+    assert q_kb is not None
+    assert "ask_cancel_j_test" in q_kb.inline_keyboard[0][0].callback_data
+
+    # Failed job keyboard: should have Retry button
+    f_kb = build_job_action_keyboard("j_test", "failed")
+    assert f_kb is not None
+    assert "ask_retry_j_test" in f_kb.inline_keyboard[0][0].callback_data
+
+    # Completed job: should NOT have cancel or retry button
+    c_kb = build_job_action_keyboard("j_test", "completed")
+    assert c_kb is not None
+    data_all = [btn.callback_data for row in c_kb.inline_keyboard for btn in row]
+    assert not any("cancel" in d or "retry" in d for d in data_all)
+
+    # Confirmation keyboards
+    conf_c = build_confirmation_keyboard("cancel", "j_test")
+    assert "do_cancel_j_test" in conf_c.inline_keyboard[0][0].callback_data
+
+    conf_r = build_confirmation_keyboard("retry", "j_test")
+    assert "do_retry_j_test" in conf_r.inline_keyboard[0][0].callback_data
+
+
+@pytest.mark.asyncio
+async def test_callback_unauthorized_rejected(temp_dirs):
+    _, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=777,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR="/tmp",
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+
+    # Unauthorized callback
+    update = MagicMock()
+    update.effective_user.id = 999999
+    update.callback_query.answer = AsyncMock()
+    context = MagicMock()
+
+    await app.handle_callback_query(update, context)
+    update.callback_query.answer.assert_called_with("⛔ هذا البوت شخصي وخاص بالمالك فقط.", show_alert=True)
+
+
+@pytest.mark.asyncio
+async def test_callback_navigation_actions(temp_dirs):
+    staging, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=777,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+    app.application = MagicMock()
+    app.application.bot.edit_message_text = AsyncMock()
+
+    update = MagicMock()
+    update.effective_user.id = 777
+    update.callback_query.message.chat_id = 123
+    update.callback_query.message.message_id = 456
+    update.callback_query.answer = AsyncMock()
+    context = MagicMock()
+
+    # 1. nav_status
+    update.callback_query.data = "nav_status"
+    await app.handle_callback_query(update, context)
+    app.application.bot.edit_message_text.assert_called()
+    assert "حالة النظام التشغيلية" in app.application.bot.edit_message_text.call_args[1]["text"]
+
+    # 2. nav_storage
+    app.application.bot.edit_message_text.reset_mock()
+    update.callback_query.data = "nav_storage"
+    await app.handle_callback_query(update, context)
+    assert "تشخيص وسائط التخزين" in app.application.bot.edit_message_text.call_args[1]["text"]
+
+    # 3. nav_history
+    app.application.bot.edit_message_text.reset_mock()
+    update.callback_query.data = "nav_history"
+    await app.handle_callback_query(update, context)
+    assert "سجل المهام" in app.application.bot.edit_message_text.call_args[1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_callback_confirmation_and_execution_lifecycle(temp_dirs):
+    staging, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=777,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+    app.application = MagicMock()
+    app.application.bot.edit_message_text = AsyncMock()
+
+    # Prepare failed job
+    app.state.add_job("j_cb_retry", "direct_url", "failed.bin", 777, 777)
+    app.state.update_job("j_cb_retry", status="failed")
+
+    update = MagicMock()
+    update.effective_user.id = 777
+    update.callback_query.message.chat_id = 123
+    update.callback_query.message.message_id = 456
+    update.callback_query.answer = AsyncMock()
+    context = MagicMock()
+
+    # 1. Step A: Prompt confirmation
+    update.callback_query.data = "ask_retry_j_cb_retry"
+    await app.handle_callback_query(update, context)
+    prompt_text = app.application.bot.edit_message_text.call_args[1]["text"]
+    assert "إعادة جدولة المهمة" in prompt_text
+
+    # 2. Step B: Execute confirmation
+    app.application.bot.edit_message_text.reset_mock()
+    update.callback_query.data = "do_retry_j_cb_retry"
+    await app.handle_callback_query(update, context)
+    done_text = app.application.bot.edit_message_text.call_args[1]["text"]
+    assert "تمت إعادة جدولة المهمة" in done_text
+    assert app.state.get_job("j_cb_retry")["status"] == "queued"
+    assert app.queue.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_callback_stale_button_protection(temp_dirs):
+    staging, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=777,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+
+    # Job is already completed in backend
+    app.state.add_job("j_stale", "direct_url", "completed.bin", 777, 777)
+    app.state.update_job("j_stale", status="downloading")
+    app.state.update_job("j_stale", status="downloaded")
+    app.state.update_job("j_stale", status="verifying")
+    app.state.update_job("j_stale", status="completed")
+
+    update = MagicMock()
+    update.effective_user.id = 777
+    update.callback_query.answer = AsyncMock()
+    context = MagicMock()
+
+    # User clicks stale "ask_cancel" on completed job
+    update.callback_query.data = "ask_cancel_j_stale"
+    await app.handle_callback_query(update, context)
+    update.callback_query.answer.assert_called_with("⚠️ لا يمكن إلغاء هذه المهمة (حالتها تغيرت بالفعل).", show_alert=True)
+    # Status remains completed
+    assert app.state.get_job("j_stale")["status"] == "completed"

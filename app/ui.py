@@ -1,9 +1,10 @@
-"""UI formatting, progress throttling, and error presentation helpers for Telegram."""
+"""UI formatting, progress throttling, keyboards, and error presentation helpers for Telegram."""
 
 from __future__ import annotations
 
 import time
-from typing import Optional
+from typing import Any, Dict, List, Optional
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 
 def format_bytes(num_bytes: Optional[int]) -> str:
@@ -133,3 +134,64 @@ class ProgressTracker:
                 f"• تم تنزيل: {curr_str} (الحجم الإجمالي غير محدد)\n"
                 f"• السرعة: {speed_str}"
             )
+
+
+# ---------------------------------------------------------
+# Milestone 6: Keyboards & Interactive Inline UI
+# ---------------------------------------------------------
+
+def build_main_keyboard() -> InlineKeyboardMarkup:
+    """Build compact, mobile-friendly main owner dashboard keyboard."""
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 الحالة", callback_data="nav_status"),
+            InlineKeyboardButton("📜 السجل", callback_data="nav_history"),
+            InlineKeyboardButton("💾 التخزين", callback_data="nav_storage"),
+        ],
+        [
+            InlineKeyboardButton("❌ إلغاء الجارية", callback_data="act_cancel_active"),
+            InlineKeyboardButton("📖 المساعدة", callback_data="nav_help"),
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_job_action_keyboard(job_id: str, status: str) -> Optional[InlineKeyboardMarkup]:
+    """Generate state-aware action buttons for a specific job."""
+    buttons: List[List[InlineKeyboardButton]] = []
+
+    if status in {"queued", "downloading", "verifying"}:
+        buttons.append([
+            InlineKeyboardButton("❌ تأكيد الإلغاء", callback_data=f"ask_cancel_{job_id}"),
+            InlineKeyboardButton("🔄 تحديث", callback_data=f"job_detail_{job_id}"),
+        ])
+    elif status in {"failed", "cancelled"}:
+        buttons.append([
+            InlineKeyboardButton("🔁 إعادة المحاولة", callback_data=f"ask_retry_{job_id}"),
+            InlineKeyboardButton("🔄 تحديث", callback_data=f"job_detail_{job_id}"),
+        ])
+    elif status == "completed":
+        buttons.append([
+            InlineKeyboardButton("ℹ️ معلومات تفصيلية", callback_data=f"job_detail_{job_id}")
+        ])
+
+    return InlineKeyboardMarkup(buttons) if buttons else None
+
+
+def build_confirmation_keyboard(action: str, job_id: str) -> InlineKeyboardMarkup:
+    """Build single-tap confirmation keyboard with cancel/back options."""
+    if action == "cancel":
+        keyboard = [
+            [
+                InlineKeyboardButton("⚠️ نعم، إلغاء المهمة", callback_data=f"do_cancel_{job_id}"),
+                InlineKeyboardButton("تراجع", callback_data=f"job_detail_{job_id}"),
+            ]
+        ]
+    else:  # retry
+        keyboard = [
+            [
+                InlineKeyboardButton("🔄 نعم، إعادة المحاولة", callback_data=f"do_retry_{job_id}"),
+                InlineKeyboardButton("تراجع", callback_data=f"job_detail_{job_id}"),
+            ]
+        ]
+    return InlineKeyboardMarkup(keyboard)
