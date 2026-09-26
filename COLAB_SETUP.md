@@ -31,13 +31,14 @@ In the left sidebar of Google Colab, open **Secrets** (key icon) and set:
 * `TELEGRAM_BOT_TOKEN`: The API token from `@BotFather`.
 * `OWNER_ID`: Your numerical Telegram user ID (from `@userinfobot`).
 
-## Operational Commands (Milestones 2, 3 & 4)
+## Operational Commands (Milestones 2, 3, 4 & 5)
 
 * `/status` : View real-time bot state, active job, queue count, and transfer metrics.
+* `/status <job_id>` : Inspect full lifecycle metadata, timestamps, hash, and path for a specific job.
 * `/storage` : View storage diagnostics (Google Drive destination writability, mount status, local staging disk capacity).
-* `/history` : Review recent completed, failed, and cancelled transfer history.
+* `/history` : Review recent completed, failed, and cancelled transfer history chronologically.
 * `/cancel` : Safely cancel the currently active transfer, or specify a job ID via `/cancel <job_id>`.
-* `/retry <job_id>` : Requeue failed or cancelled transfers with original metadata.
+* `/retry <job_id>` : Requeue failed or cancelled transfers with original metadata (increments retry count).
 * `/help` : View available commands and operational notes.
 
 ## Hardened Download Engine (Milestone 3)
@@ -57,6 +58,14 @@ In the left sidebar of Google Colab, open **Secrets** (key icon) and set:
 * **Two-Point Cryptographic Verification:** Incremental SHA-256 and byte-size matching computed both on local staging and upon destination `.part_<job_id>_*` landing before destination promotion via `os.replace`.
 * **Duplicate & Collision Safety:** Exact SHA-256 matches skip redundant copying (`duplicate_skipped`); different content with identical names receives sequential collision suffixes (`file (1).ext`).
 * **Scoped Orphan Cleanup:** Startup recovery removes only `.part_<job_id>_*` files whose associated job is terminal or absent from `StateStore`. Valid files and user folders are never touched.
+
+## Advanced Job Manager & Lifecycle (Milestone 5)
+
+* **Enforced Authoritative Transitions:** `queued` $\to$ `downloading` $\to$ `downloaded` $\to$ `verifying` $\to$ `completed` with strict rejection of illegal jumps.
+* **Lifecycle Timestamps:** Automatically records `created_at`, `started_at`, and `completed_at` timestamps.
+* **Queue Invariant & Duplicate Prevention:** `safe_enqueue_job` guarantees no job ID can enter the processing queue twice.
+* **Safe State Retention:** Bounded history retention prunes only oldest terminal jobs while protecting all active/queued and recovery-critical jobs.
+* **Structured Correlated Logging:** Every lifecycle milestone is tagged with `[job=<id>]` for streamlined log analysis.
 
 ## How Persistence & Recovery Work
 

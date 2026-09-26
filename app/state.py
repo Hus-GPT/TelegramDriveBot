@@ -122,7 +122,7 @@ class StateStore:
         state_dir = os.path.dirname(self.state_path)
         os.makedirs(state_dir, exist_ok=True)
 
-        # Enforce history limit to avoid unbounded memory / JSON growth
+        # Enforce history retention to keep JSON bounded without deleting active/recovery jobs
         jobs = self.data.get("jobs", [])
         if len(jobs) > self.max_history:
             terminal_jobs = [j for j in jobs if j.get("status") in {"completed", "failed", "cancelled"}]
@@ -159,6 +159,11 @@ class StateStore:
         telegram_message_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         with self._lock:
+            # Check for existing job with same ID
+            for j in self.data.get("jobs", []):
+                if j.get("id") == str(job_id):
+                    return dict(j)
+
             job = {
                 "id": str(job_id),
                 "source_type": source_type,
@@ -170,6 +175,8 @@ class StateStore:
                 "user_id": user_id,
                 "status": "queued",
                 "created_at": now_utc_iso(),
+                "started_at": None,
+                "completed_at": None,
                 "updated_at": now_utc_iso(),
                 "retries": 0,
                 "sha256": None,
@@ -199,6 +206,12 @@ class StateStore:
                                 f"انتقال حالة غير مسموح به برمجياً من '{old_status}' إلى '{new_status}' للمهمة {job_id}"
                             )
 
+                        # Set timestamps automatically for lifecycle milestones
+                        if new_status == "downloading" and not job.get("started_at"):
+                            job["started_at"] = now_utc_iso()
+                        elif new_status in {"completed", "failed", "cancelled"}:
+                            job["completed_at"] = now_utc_iso()
+
                     job.update(kwargs)
                     job["updated_at"] = now_utc_iso()
                     self._save()
@@ -217,7 +230,9 @@ class StateStore:
                         )
                     job["status"] = "queued"
                     job["error"] = None
-                    job["retries"] = 0
+                    job["retries"] = job.get("retries", 0) + 1
+                    job["started_at"] = None
+                    job["completed_at"] = None
                     job["recovery_from_status"] = current_status
                     job["updated_at"] = now_utc_iso()
                     self._save()
@@ -235,6 +250,8 @@ class StateStore:
                     job["recovery_from_status"] = current_status
                     job["recovery_at"] = now_utc_iso()
                     job["status"] = target_status
+                    if target_status == "queued":
+                        job["started_at"] = None
                     job.update(kwargs)
                     job["updated_at"] = now_utc_iso()
                     self._save()

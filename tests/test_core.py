@@ -1,4 +1,4 @@
-"""Comprehensive automated test suite for TelegramDriveBot Core Reliability, UX & Milestone 4 Drive Intelligence."""
+"""Comprehensive automated test suite for TelegramDriveBot Core Reliability, UX & Milestone 5 Advanced Job Manager."""
 
 import asyncio
 import hashlib
@@ -360,7 +360,7 @@ async def test_queued_job_cancellation_skips_worker(temp_dirs):
     app = TelegramDriveBotApp(cfg)
 
     job = app.state.add_job("j_cancel_q", "direct_url", "test.bin", 123456, 123456, source_url="http://mock.com/t.bin")
-    await app.queue.put(job)
+    await app.safe_enqueue_job(job)
 
     app.state.update_job("j_cancel_q", status="cancelled")
 
@@ -462,6 +462,7 @@ def test_recovery_idempotency(temp_dirs):
 
     while not app.queue.empty():
         app.queue.get_nowait()
+    app.queued_ids.clear()
 
     app.restore_unfinished()
     state_after_2 = json.dumps(app.state.data, sort_keys=True)
@@ -906,14 +907,13 @@ def test_download_redirect_and_content_disposition_precedence(temp_dirs):
         os.remove(path)
 
 
-# =========================================================
-# MILESTONE 4: Drive Storage Intelligence & Validation
-# =========================================================
+# ---------------------------------------------------------
+# 11. Drive Storage Intelligence & Validation (Milestone 4)
+# ---------------------------------------------------------
 
 def test_validate_destination_directory_success(temp_dirs):
     _, drive = temp_dirs
     target_sub = os.path.join(drive, "subfolder", "target")
-    # Must create directory and probe write
     validated = validate_destination_directory(target_sub)
     assert os.path.exists(validated)
     assert os.path.isdir(validated)
@@ -972,3 +972,115 @@ async def test_cmd_storage(temp_dirs):
     assert "تشخيص وسائط التخزين" in msg
     assert "Google Drive Destination" in msg
     assert "Local Staging" in msg
+
+
+# =========================================================
+# MILESTONE 5: Advanced Job Manager Tests
+# =========================================================
+
+def test_job_metadata_lifecycle_timestamps(temp_dirs):
+    _, drive = temp_dirs
+    store = StateStore(os.path.join(drive, "state.json"))
+
+    job = store.add_job("j_meta", "direct_url", "test.bin", 1, 2)
+    assert job["created_at"] is not None
+    assert job["started_at"] is None
+    assert job["completed_at"] is None
+
+    store.update_job("j_meta", status="downloading")
+    j_dl = store.get_job("j_meta")
+    assert j_dl["started_at"] is not None
+
+    store.update_job("j_meta", status="downloaded")
+    store.update_job("j_meta", status="verifying")
+    store.update_job("j_meta", status="completed")
+    j_comp = store.get_job("j_meta")
+    assert j_comp["completed_at"] is not None
+
+
+def test_state_retention_preserves_active_jobs(temp_dirs):
+    _, drive = temp_dirs
+    # Configure tight max_history of 50
+    store = StateStore(os.path.join(drive, "state.json"), max_history=50)
+
+    # Add 55 completed jobs
+    for i in range(55):
+        j_id = f"c_{i}"
+        store.add_job(j_id, "direct_url", f"file_{i}.bin", 1, 2)
+        store.update_job(j_id, status="downloading")
+        store.update_job(j_id, status="downloaded")
+        store.update_job(j_id, status="verifying")
+        store.update_job(j_id, status="completed")
+
+    # Add 2 active queued jobs
+    store.add_job("active_1", "direct_url", "a1.bin", 1, 2)
+    store.add_job("active_2", "direct_url", "a2.bin", 1, 2)
+
+    # Active jobs must NEVER be pruned
+    all_j = store.all_jobs()
+    ids = {j["id"] for j in all_j}
+    assert "active_1" in ids
+    assert "active_2" in ids
+    # Oldest completed jobs should have been pruned to keep under limit
+    assert "c_0" not in ids
+    assert "c_54" in ids
+
+
+@pytest.mark.asyncio
+async def test_queue_duplicate_enqueue_prevention(temp_dirs):
+    staging, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=777,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+
+    job = app.state.add_job("j_dup_q", "direct_url", "dup.bin", 777, 777)
+
+    # First enqueue succeeds
+    first = await app.safe_enqueue_job(job)
+    assert first is True
+    assert app.queue.qsize() == 1
+
+    # Second enqueue of identical job ID is rejected
+    second = await app.safe_enqueue_job(job)
+    assert second is False
+    assert app.queue.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_cmd_status_job_detail_mode(temp_dirs):
+    staging, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=777,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+
+    app.state.add_job("job_detail_1", "direct_url", "report.pdf", 777, 777)
+    app.state.update_job("job_detail_1", status="downloading")
+    app.state.update_job("job_detail_1", status="downloaded")
+    app.state.update_job("job_detail_1", status="verifying")
+    app.state.update_job("job_detail_1", status="completed", sha256="abcd1234ef", size=1024 * 1024, destination_path="/drive/report.pdf")
+
+    update = MagicMock()
+    update.effective_user.id = 777
+    update.effective_message.reply_text = AsyncMock()
+    context = MagicMock()
+
+    # /status job_detail_1
+    context.args = ["job_detail_1"]
+    await app.cmd_status(update, context)
+    update.effective_message.reply_text.assert_called_once()
+    msg = update.effective_message.reply_text.call_args[0][0]
+    assert "تفاصيل المهمة" in msg
+    assert "job_detail_1" in msg
+    assert "report.pdf" in msg
+    assert "abcd1234ef" in msg
+    assert "completed" in msg
