@@ -32,6 +32,7 @@ from app.transfer import (
     finalize_to_drive,
     hash_file,
     safe_filename,
+    validate_url_security,
 )
 from app.ui import ProgressTracker, format_bytes, humanize_error
 
@@ -192,7 +193,6 @@ class TelegramDriveBotApp:
                 sz = format_bytes(j_data.get("size"))
                 report += f"• المعرّف: `{j_id}`\n  الملف: `{fname}`\n  الحالة: {st} | الحجم: {sz}\n\n"
 
-        # Show pending queued jobs if any
         queued_jobs = [j for j in active if j.get("status") == "queued"]
         if queued_jobs:
             report += "⏳ *مهام في طابور الانتظار:*\n"
@@ -242,7 +242,6 @@ class TelegramDriveBotApp:
         if args:
             job_id = args[0].strip()
         else:
-            # If no argument, target the currently active transfer
             if self.active_jobs:
                 job_id = next(iter(self.active_jobs.keys()))
             else:
@@ -262,7 +261,6 @@ class TelegramDriveBotApp:
             await update.effective_message.reply_text(f"ℹ️ المهمة `{job_id}` في حالة منتهية بالفعل ({current_status}).")
             return
 
-        # Trigger cancellation event if active
         event = self.cancel_events.get(job_id)
         if event:
             event.set()
@@ -335,6 +333,14 @@ class TelegramDriveBotApp:
         url_match = URL_REGEX.search(text)
         if url_match:
             url = url_match.group(0)
+
+            # Security validation upfront
+            try:
+                validate_url_security(url)
+            except NonRetryableTransferError as exc:
+                await message.reply_text(f"⛔ {exc}")
+                return
+
             job_id = str(uuid.uuid4())[:8]
             fname = extract_filename_from_url(url, f"file_{job_id}.bin")
 
@@ -354,7 +360,6 @@ class TelegramDriveBotApp:
                 source_url=url,
                 telegram_message_id=message.message_id,
             )
-            # Attach ephemeral UI tracking to job
             job["ui_message_id"] = ack_msg.message_id
             await self.queue.put(job)
             return
@@ -409,14 +414,12 @@ class TelegramDriveBotApp:
                 job = await self.queue.get()
                 job_id = job["id"]
 
-                # Fresh state check before executing (skips jobs cancelled while queued)
                 current_job = self.state.get_job(job_id)
                 if not current_job or current_job.get("status") == "cancelled":
                     logger.info("Job %s was cancelled while queued; skipping worker execution.", job_id)
                     self.queue.task_done()
                     continue
 
-                # Preserve ephemeral ui_message_id if passed in memory
                 if "ui_message_id" in job:
                     current_job["ui_message_id"] = job["ui_message_id"]
 
@@ -458,7 +461,6 @@ class TelegramDriveBotApp:
         try:
             loop = asyncio.get_running_loop()
 
-            # Skip download if recovering a job whose local staging is already fully intact
             skip_download = False
             if job.get("status") == "downloaded" and temp_file_path and os.path.exists(temp_file_path):
                 try:
@@ -514,7 +516,6 @@ class TelegramDriveBotApp:
                 if not download_link:
                     raise NonRetryableTransferError("تعذر تحديد رابط التحميل للمهمة.")
 
-                # Progress tracker instance with debouncing
                 tracker = ProgressTracker(resolved_name, min_interval=self.config.PROGRESS_INTERVAL)
 
                 def on_progress(bytes_written: int, total_expected: Optional[int]) -> None:
@@ -525,15 +526,20 @@ class TelegramDriveBotApp:
                             loop,
                         )
 
+                timeout_tuple = (self.config.CONNECT_TIMEOUT, self.config.READ_TIMEOUT)
                 temp_file_path, resolved_name, size = await loop.run_in_executor(
                     None,
-                    download_url,
-                    download_link,
-                    temp_dir,
-                    job.get("filename"),
-                    cancel_event,
-                    self.config.MAX_RETRIES,
-                    on_progress,
+                    lambda: download_url(
+                        url=download_link,
+                        temp_root=temp_dir,
+                        custom_filename=job.get("filename"),
+                        cancel_event=cancel_event,
+                        max_retries=self.config.MAX_RETRIES,
+                        progress_callback=on_progress,
+                        timeout=timeout_tuple,
+                        max_download_size=self.config.MAX_DOWNLOAD_SIZE,
+                        max_redirects=self.config.MAX_REDIRECTS,
+                    ),
                 )
 
                 sha256_val, _ = hash_file(temp_file_path)
@@ -567,7 +573,6 @@ class TelegramDriveBotApp:
                 cancel_event,
             )
 
-            # Stage 3: Polished completion notification
             dup_note = " (تم تخطي النقل لوجود ملف مطابق بالبصمة)" if result.is_duplicate else ""
             col_note = " (تمت إعادة التسمية لمنع استبدال ملف سابق)" if result.action == "collision_renamed" else ""
             final_name = os.path.basename(result.destination_path)

@@ -1,4 +1,4 @@
-"""Comprehensive automated test suite for TelegramDriveBot Core Reliability & Milestone 2 UX."""
+"""Comprehensive automated test suite for TelegramDriveBot Core Reliability, UX & Milestone 3 Download Hardening."""
 
 import asyncio
 import hashlib
@@ -22,6 +22,7 @@ from app.transfer import (
     hash_file,
     parse_content_disposition,
     safe_filename,
+    validate_url_security,
 )
 from app.bot import File2URLProvider, TelegramDriveBotApp
 from app.ui import ProgressTracker, format_bytes, format_duration, humanize_error
@@ -512,27 +513,27 @@ def test_download_error_classification(temp_dirs):
 
     with patch("requests.Session.get", return_value=MockResponse(404)):
         with pytest.raises(NonRetryableTransferError):
-            download_url("http://mock/404", staging, max_retries=1)
+            download_url("http://example.com/404", staging, max_retries=1)
 
     with patch("requests.Session.get", return_value=MockResponse(403)):
         with pytest.raises(NonRetryableTransferError):
-            download_url("http://mock/403", staging, max_retries=1)
+            download_url("http://example.com/403", staging, max_retries=1)
 
     with patch("requests.Session.get", return_value=MockResponse(200, b"<html></html>", {"Content-Type": "text/html"})):
         with pytest.raises(NonRetryableTransferError):
-            download_url("http://mock/html", staging, max_retries=1)
+            download_url("http://example.com/html", staging, max_retries=1)
 
     with patch("requests.Session.get", return_value=MockResponse(200, b"", {"Content-Type": "application/octet-stream"})):
         with pytest.raises(NonRetryableTransferError):
-            download_url("http://mock/empty", staging, max_retries=1)
+            download_url("http://example.com/empty", staging, max_retries=1)
 
     with patch("requests.Session.get", return_value=MockResponse(500)):
         with pytest.raises(RetryableTransferError):
-            download_url("http://mock/500", staging, max_retries=2)
+            download_url("http://example.com/500", staging, max_retries=2)
 
     with patch("requests.Session.get", return_value=MockResponse(429)):
         with pytest.raises(RetryableTransferError):
-            download_url("http://mock/429", staging, max_retries=2)
+            download_url("http://example.com/429", staging, max_retries=2)
 
 
 def test_owner_authorization(temp_dirs):
@@ -555,9 +556,9 @@ def test_owner_authorization(temp_dirs):
     assert app.is_authorized(mock_unauth_update) is False
 
 
-# =========================================================
-# MILESTONE 2: UX, Commands, Formatting & Failure Isolation
-# =========================================================
+# ---------------------------------------------------------
+# 9. UI, Commands & Failure Isolation (Milestone 2)
+# ---------------------------------------------------------
 
 def test_ui_helpers_formatting():
     assert format_bytes(500) == "500 B"
@@ -588,7 +589,6 @@ def test_humanize_error_translations():
     err_empty = humanize_error(Exception("الملف فارغ بحجم صفر بايت"))
     assert "فارغ" in err_empty
 
-    # Verify sensitive token is never leaked
     err_secret = humanize_error(Exception("SensitiveToken123456 unexpected failure"))
     assert "SensitiveToken123456" not in err_secret
     assert "تعذر إكمال عملية النقل" in err_secret
@@ -596,18 +596,13 @@ def test_humanize_error_translations():
 
 def test_progress_tracker_throttling():
     tracker = ProgressTracker("test.zip", min_interval=2.0)
-    # First update triggers
     assert tracker.should_update(100, 1000) is True
-
-    # Immediate second call should be throttled
     assert tracker.should_update(200, 1000) is False
 
-    # Text structure
     text = tracker.build_progress_text(500, 1000)
     assert "test.zip" in text
     assert "50.0%" in text
 
-    # Unknown total size text structure
     text_unknown = tracker.build_progress_text(500, None)
     assert "غير محدد" in text_unknown
 
@@ -624,11 +619,9 @@ async def test_cmd_start_and_help(temp_dirs):
     )
     app = TelegramDriveBotApp(cfg)
 
-    # Authorized update
     update = MagicMock()
     update.effective_user.id = 777
     update.effective_message.reply_text = AsyncMock()
-
     context = MagicMock()
 
     await app.cmd_start(update, context)
@@ -668,13 +661,11 @@ async def test_cmd_status_and_history(temp_dirs):
     update.effective_message.reply_text = AsyncMock()
     context = MagicMock()
 
-    # /status
     await app.cmd_status(update, context)
     status_text = update.effective_message.reply_text.call_args[0][0]
     assert "file_active.bin" in status_text
     assert "j_act" in status_text
 
-    # /history
     update.effective_message.reply_text.reset_mock()
     await app.cmd_history(update, context)
     hist_text = update.effective_message.reply_text.call_args[0][0]
@@ -699,12 +690,10 @@ async def test_cmd_cancel_modes(temp_dirs):
     update.effective_message.reply_text = AsyncMock()
     context = MagicMock()
 
-    # 1. /cancel with no active transfer
     context.args = []
     await app.cmd_cancel(update, context)
     assert "لا توجد عملية نشطة" in update.effective_message.reply_text.call_args[0][0]
 
-    # 2. /cancel with active transfer (default targeting)
     app.state.add_job("j_active_canc", "direct_url", "act.bin", 777, 777)
     app.state.update_job("j_active_canc", status="downloading")
     app.active_jobs["j_active_canc"] = app.state.get_job("j_active_canc")
@@ -717,7 +706,6 @@ async def test_cmd_cancel_modes(temp_dirs):
     assert "تم إلغاء المهمة" in update.effective_message.reply_text.call_args[0][0]
     assert app.state.get_job("j_active_canc")["status"] == "cancelled"
 
-    # 3. /cancel on already completed job
     app.state.add_job("j_done_canc", "direct_url", "done.bin", 777, 777)
     app.state.update_job("j_done_canc", status="completed")
     context.args = ["j_done_canc"]
@@ -743,12 +731,10 @@ async def test_cmd_retry_validation(temp_dirs):
     update.effective_message.reply_text = AsyncMock()
     context = MagicMock()
 
-    # 1. /retry without args
     context.args = []
     await app.cmd_retry(update, context)
     assert "يرجى تحديد معرّف المهمة" in update.effective_message.reply_text.call_args[0][0]
 
-    # 2. /retry on active job
     app.state.add_job("j_act_ret", "direct_url", "a.bin", 777, 777)
     app.state.update_job("j_act_ret", status="downloading")
     context.args = ["j_act_ret"]
@@ -756,7 +742,6 @@ async def test_cmd_retry_validation(temp_dirs):
     await app.cmd_retry(update, context)
     assert "جارية أو في الانتظار بالفعل" in update.effective_message.reply_text.call_args[0][0]
 
-    # 3. /retry on completed job
     app.state.add_job("j_comp_ret", "direct_url", "c.bin", 777, 777)
     app.state.update_job("j_comp_ret", status="completed")
     context.args = ["j_comp_ret"]
@@ -764,7 +749,6 @@ async def test_cmd_retry_validation(temp_dirs):
     await app.cmd_retry(update, context)
     assert "مكتملة بنجاح" in update.effective_message.reply_text.call_args[0][0]
 
-    # 4. /retry on failed job succeeds and enqueues
     app.state.add_job("j_fail_ret", "direct_url", "f.bin", 777, 777)
     app.state.update_job("j_fail_ret", status="failed")
     context.args = ["j_fail_ret"]
@@ -777,7 +761,6 @@ async def test_cmd_retry_validation(temp_dirs):
 
 @pytest.mark.asyncio
 async def test_ui_failure_isolation():
-    """Verify that Telegram UI message editing failures never cause underlying operations to fail."""
     cfg = Config(
         TELEGRAM_BOT_TOKEN="mock_token",
         OWNER_ID=777,
@@ -789,6 +772,143 @@ async def test_ui_failure_isolation():
     app.application = MagicMock()
     app.application.bot.edit_message_text = AsyncMock(side_effect=Exception("Telegram Network Timeout"))
 
-    # Calling safe_edit_text catches exception cleanly and returns False
     res = await app.safe_edit_text(123, 456, "Sample text")
     assert res is False
+
+
+# =========================================================
+# MILESTONE 3: Download Engine Hardening Tests
+# =========================================================
+
+def test_url_security_ssrf_and_schemes():
+    # Valid external URLs
+    validate_url_security("https://example.com/file.zip")
+    validate_url_security("http://cdn.example.org:8080/data?key=123")
+
+    # Invalid scheme
+    with pytest.raises(NonRetryableTransferError) as exc:
+        validate_url_security("ftp://example.com/file.zip")
+    assert "غير مدعوم" in str(exc.value)
+
+    # Localhost / loopback
+    with pytest.raises(NonRetryableTransferError):
+        validate_url_security("http://localhost/admin")
+    with pytest.raises(NonRetryableTransferError):
+        validate_url_security("http://127.0.0.1:8000/secret")
+    with pytest.raises(NonRetryableTransferError):
+        validate_url_security("http://[::1]/secret")
+
+    # Cloud metadata endpoints
+    with pytest.raises(NonRetryableTransferError):
+        validate_url_security("http://metadata.google.internal/computeMetadata/v1/")
+
+    # Private IP subnets
+    with pytest.raises(NonRetryableTransferError):
+        validate_url_security("http://10.0.0.1/file")
+    with pytest.raises(NonRetryableTransferError):
+        validate_url_security("http://192.168.1.1/backup.tar")
+    with pytest.raises(NonRetryableTransferError):
+        validate_url_security("http://172.16.0.5/conf")
+
+
+def test_unicode_and_arabic_safe_filename():
+    assert safe_filename("تقرير_المشروع_2026.pdf") == "تقرير_المشروع_2026.pdf"
+    assert safe_filename("ملف مستند هام.docx") == "ملف مستند هام.docx"
+    assert safe_filename("../../ملف_سري.zip") == "ملف_سري.zip"
+    assert safe_filename("path/to/ملف.tar.gz") == "ملف.tar.gz"
+
+
+def test_download_streaming_and_content_length_limit(temp_dirs):
+    staging, _ = temp_dirs
+
+    class MockResponse:
+        def __init__(self, status_code=200, headers=None, chunks=None):
+            self.status_code = status_code
+            self.headers = headers or {}
+            self.url = "https://example.com/stream.bin"
+            self._chunks = chunks or [b"chunk1", b"chunk2", b"chunk3"]
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size=1024):
+            for c in self._chunks:
+                yield c
+
+    # 1. Successful streamed download
+    with patch("requests.Session.get", return_value=MockResponse(headers={"Content-Length": "18"})):
+        path, fname, size = download_url("https://example.com/stream.bin", staging)
+        assert os.path.exists(path)
+        assert size == 18
+        assert fname == "stream.bin"
+        os.remove(path)
+
+    # 2. Exceeding max_download_size via Content-Length header upfront
+    with patch("requests.Session.get", return_value=MockResponse(headers={"Content-Length": "1000"})):
+        with pytest.raises(NonRetryableTransferError) as exc:
+            download_url("https://example.com/stream.bin", staging, max_download_size=500)
+        assert "يتجاوز الحد الأقصى" in str(exc.value)
+
+    # 3. Exceeding max_download_size dynamically during chunk streaming
+    with patch("requests.Session.get", return_value=MockResponse(headers={}, chunks=[b"a" * 300, b"b" * 300])):
+        with pytest.raises(NonRetryableTransferError) as exc:
+            download_url("https://example.com/stream.bin", staging, max_download_size=500)
+        assert "تجاوز الحد الأقصى" in str(exc.value)
+
+
+def test_download_cancellation_during_streaming_cleans_partial(temp_dirs):
+    staging, _ = temp_dirs
+    cancel_evt = threading.Event()
+
+    class CancellableResponse:
+        def __init__(self):
+            self.status_code = 200
+            self.headers = {"Content-Length": "5000"}
+            self.url = "https://example.com/large.bin"
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size=1024):
+            yield b"first chunk"
+            # Cancel in middle of stream
+            cancel_evt.set()
+            yield b"second chunk"
+
+    with patch("requests.Session.get", return_value=CancellableResponse()):
+        with pytest.raises(NonRetryableTransferError) as exc:
+            download_url("https://example.com/large.bin", staging, cancel_event=cancel_evt)
+        assert "تم إلغاء عملية النقل" in str(exc.value)
+
+    # Ensure no leftover .part file was leaked in staging
+    staged_files = os.listdir(staging)
+    assert len(staged_files) == 0
+
+
+def test_download_redirect_and_content_disposition_precedence(temp_dirs):
+    staging, _ = temp_dirs
+
+    class RedirectResponse:
+        def __init__(self):
+            self.status_code = 200
+            self.headers = {
+                "Content-Length": "12",
+                "Content-Disposition": 'attachment; filename="final_document.pdf"',
+            }
+            self.url = "https://cdn.example.org/downloads/v1/download?id=999"
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size=1024):
+            yield b"valid content"
+
+    with patch("requests.Session.get", return_value=RedirectResponse()):
+        path, resolved_name, size = download_url(
+            "https://short.link/xyz",
+            staging,
+            custom_filename=None,
+        )
+        assert resolved_name == "final_document.pdf"
+        assert size == 13
+        os.remove(path)

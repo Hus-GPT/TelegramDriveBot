@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import glob
 import hashlib
+import ipaddress
 import logging
 import os
 import re
 import shutil
+import socket
 import tempfile
 import urllib.parse
 from dataclasses import dataclass
@@ -20,6 +22,7 @@ logger = logging.getLogger(__name__)
 CHUNK_SIZE = 1024 * 1024  # 1 MB chunk for streaming and hashing
 DEFAULT_TIMEOUT = (15, 60)  # (connect_timeout, read_timeout) in seconds
 MAX_STREAM_SIZE = 100 * 1024 * 1024 * 1024  # 100 GB safety sanity limit
+MAX_REDIRECTS = 10
 
 
 class TransferError(Exception):
@@ -28,7 +31,7 @@ class TransferError(Exception):
 
 
 class NonRetryableTransferError(TransferError):
-    """Explicitly non-retryable transfer failure (e.g. 400, 401, 403, 404, 405, 410, bad request, cancelled)."""
+    """Explicitly non-retryable transfer failure (e.g. 400, 401, 403, 404, 405, 410, SSRF, bad request, cancelled)."""
     pass
 
 
@@ -46,29 +49,61 @@ class FinalizeResult:
     action: str  # "copied", "duplicate_skipped", "collision_renamed"
 
 
+def validate_url_security(url: str) -> None:
+    """Validate URL scheme and protect against SSRF targets (localhost, private subnets, metadata IPs)."""
+    if not url or len(url) > 2048:
+        raise NonRetryableTransferError("الرابط غير صالح أو يتجاوز الحد الأقصى للطول (2048 حرفاً).")
+
+    parsed = urllib.parse.urlsplit(url.strip())
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise NonRetryableTransferError(f"بروتوكول الرابط غير مدعوم ({parsed.scheme}). الروابط المدعومة هي http و https فقط.")
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise NonRetryableTransferError("الرابط غير صالح: لا يحتوي على اسم مضيف (hostname).")
+
+    # Block well-known loopback names
+    lower_host = hostname.lower().strip("[]")
+    if lower_host in {"localhost", "127.0.0.1", "::1", "metadata.google.internal", "metadata.local"}:
+        raise NonRetryableTransferError("محظور: لا يمكن تحميل عناوين الخوادم المحلية أو خدمات البيانات الوصفية (SSRF Protection).")
+
+    # Check if host is direct IP address and block private/link-local/loopback
+    try:
+        ip = ipaddress.ip_address(lower_host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            raise NonRetryableTransferError("محظور: لا يمكن التحميل من نطاقات الشبكة الداخلية أو الخاصة (SSRF Protection).")
+    except ValueError:
+        # Hostname is a domain name, proceed normally
+        pass
+
+
 def safe_filename(name: str, fallback: str = "download.bin") -> str:
-    """Sanitize arbitrary input filename preventing path traversal and unsafe characters."""
+    """Sanitize arbitrary input filename preventing path traversal, while preserving valid Unicode (Arabic, etc.)."""
     if not name:
         return fallback
 
     # Strip URL fragments / query parameters if accidentally passed
     cleaned = name.split("?")[0].split("#")[0]
     cleaned = os.path.basename(cleaned)
-    # Remove control and reserved filesystem characters
+
+    # Remove dangerous filesystem and path traversal characters
+    # Preserve Unicode letters (e.g. Arabic, Persian, etc.), digits, spaces, dots, dashes, underscores
     cleaned = re.sub(r'[\x00-\x1f\\/:\*\?"<>\|]', "_", cleaned)
-    # Strip leading/trailing dots and spaces
-    cleaned = cleaned.strip(". ")
+
+    # Strip leading/trailing dots and whitespace
+    cleaned = cleaned.strip(". \t\r\n")
     if not cleaned or cleaned in {".", ".."}:
         return fallback
+
     return cleaned[:255]
 
 
 def extract_filename_from_url(url: str, default: str = "download.bin") -> str:
     """Extract a clean filename from a URL path, or return fallback."""
     try:
-        parsed = urllib.parse.urlparse(url)
+        parsed = urllib.parse.urlsplit(url)
         path = urllib.parse.unquote(parsed.path)
-        base = os.path.basename(path)
+        base = os.path.basename(path.rstrip("/"))
         return safe_filename(base, fallback=default)
     except Exception:
         return default
@@ -79,12 +114,13 @@ def parse_content_disposition(header: str) -> Optional[str]:
     if not header:
         return None
 
-    # Try filename* (UTF-8) first
+    # Try filename* (UTF-8) first (RFC 5987)
     match_star = re.search(r"filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;]+)", header, re.IGNORECASE)
     if match_star:
         val = match_star.group(1).strip("\"' ")
         try:
-            return safe_filename(urllib.parse.unquote(val))
+            decoded = urllib.parse.unquote(val)
+            return safe_filename(decoded)
         except Exception:
             pass
 
@@ -99,7 +135,7 @@ def parse_content_disposition(header: str) -> Optional[str]:
 
 
 def hash_file(filepath: str, chunk_size: int = CHUNK_SIZE) -> Tuple[str, int]:
-    """Calculate SHA-256 hash and exact byte size incrementally in chunks."""
+    """Calculate SHA-256 hash and exact byte size incrementally in chunks without loading file to RAM."""
     hasher = hashlib.sha256()
     total_bytes = 0
     with open(filepath, "rb") as f:
@@ -125,15 +161,23 @@ def download_url(
     cancel_event: Optional[Any] = None,
     max_retries: int = 3,
     progress_callback: Optional[Callable[[int, Optional[int]], None]] = None,
+    timeout: Tuple[int, int] = DEFAULT_TIMEOUT,
+    max_download_size: int = MAX_STREAM_SIZE,
+    max_redirects: int = MAX_REDIRECTS,
 ) -> Tuple[str, str, int]:
-    """Stream download a direct URL into a temporary file safely.
+    """Stream download a direct URL into a local temporary staging file safely.
 
-    Error Classification:
-    - Non-retryable: 400, 401, 403, 404, 405, 410, HTML landing pages, zero-byte file, user cancellation.
-      (Raises NonRetryableTransferError immediately without burning subsequent attempts).
-    - Retryable: 408 (Request Timeout), 429 (Too Many Requests), 5xx (Server Errors), connection drops, chunk timeouts.
-      (Retried up to max_retries).
+    Hardened Features (Milestone 3):
+    - Strict SSRF and URL validation before issuing requests.
+    - Full HTTP redirect following (up to max_redirects) with safety enforcement.
+    - Size ceiling validation: rejects files where Content-Length exceeds max_download_size before starting.
+    - True streaming in 1 MB chunks without buffering in RAM.
+    - Zero-byte payload rejection.
+    - HTML landing page detection and rejection.
+    - Instant cancellation response with immediate unlinking of the partial staging file.
+    - Clean retry semantics: restarting cleanly from byte 0 per attempt (no corrupt appended partials).
     """
+    validate_url_security(url)
     os.makedirs(temp_root, exist_ok=True)
     last_error: Optional[Exception] = None
 
@@ -144,12 +188,13 @@ def download_url(
 
         try:
             session = requests.Session()
+            session.max_redirects = max_redirects
             response = session.get(
                 url,
                 stream=True,
                 allow_redirects=True,
-                timeout=DEFAULT_TIMEOUT,
-                headers={"User-Agent": "TelegramDriveBot/2.0"},
+                timeout=timeout,
+                headers={"User-Agent": "TelegramDriveBot/3.0"},
             )
 
             # Strict error classification
@@ -159,19 +204,28 @@ def download_url(
                 raise RetryableTransferError(f"خطأ مؤقت قابل لإعادة المحاولة (HTTP {response.status_code})")
             response.raise_for_status()
 
+            # Reject HTML landing pages masquerading as direct downloads
             content_type = response.headers.get("Content-Type", "").lower()
             if "text/html" in content_type and not (custom_filename and custom_filename.endswith(".html")):
                 raise NonRetryableTransferError("الرابط يشير إلى صفحة ويب (HTML) وليس إلى ملف تحميل مباشر.")
 
+            # Validate Content-Length if provided
+            content_length_hdr = response.headers.get("Content-Length")
+            total_expected: Optional[int] = None
+            if content_length_hdr and content_length_hdr.strip().isdigit():
+                total_expected = int(content_length_hdr.strip())
+                if total_expected > max_download_size:
+                    raise NonRetryableTransferError(
+                        f"حجم الملف ({total_expected} بايت) يتجاوز الحد الأقصى المسموح به للنظام ({max_download_size} بايت)."
+                    )
+
+            # Resolve filename (Priority: custom_filename -> Content-Disposition -> URL path -> safe fallback)
             cd_name = parse_content_disposition(response.headers.get("Content-Disposition", ""))
             resolved_filename = (
                 safe_filename(custom_filename)
                 if custom_filename
                 else (cd_name or extract_filename_from_url(response.url or url))
             )
-
-            content_length_hdr = response.headers.get("Content-Length")
-            total_expected = int(content_length_hdr) if content_length_hdr and content_length_hdr.isdigit() else None
 
             bytes_written = 0
             with open(temp_path, "wb") as out_file:
@@ -180,6 +234,12 @@ def download_url(
                     if chunk:
                         out_file.write(chunk)
                         bytes_written += len(chunk)
+
+                        if bytes_written > max_download_size:
+                            raise NonRetryableTransferError(
+                                f"تم إيقاف التحميل: حجم البيانات المستلمة تجاوز الحد الأقصى المسموح ({max_download_size} بايت)."
+                            )
+
                         if progress_callback:
                             try:
                                 progress_callback(bytes_written, total_expected)
@@ -221,13 +281,7 @@ def download_url(
 
 
 def clean_orphan_drive_partials(destination_dir: str, state_store: Any) -> List[str]:
-    """Safely removes only orphaned .part_<job_id>_* files from Google Drive destination.
-
-    A partial file is an orphan IF AND ONLY IF:
-    1. It strictly matches the project-specific naming convention '.part_<job_id>_*'
-    2. The associated job does not exist in StateStore, OR the job is in a terminal state (completed, failed, cancelled).
-    Never touches any valid destination files or unrelated files.
-    """
+    """Safely removes only orphaned .part_<job_id>_* files from Google Drive destination."""
     cleaned: List[str] = []
     if not os.path.exists(destination_dir):
         return cleaned
@@ -261,18 +315,7 @@ def finalize_to_drive(
     job_id: str,
     cancel_event: Optional[Any] = None,
 ) -> FinalizeResult:
-    """Safely verify integrity, check duplicate/collision, and copy to Google Drive destination.
-
-    Crash-Safety Invariant:
-    1. Pre-copy source validation & state transition to 'verifying'.
-    2. Content duplicate detection (exact SHA-256 and size match avoids redundant transfer).
-    3. Collision renaming (safely appends suffix if differing content exists).
-    4. Copy to .part_<job_id>_<filename> in destination.
-    5. Post-copy cryptographic verification (SHA-256 + size match).
-    6. Atomic promotion (os.replace).
-    7. State transition to 'completed'.
-    8. Local staging file removal.
-    """
+    """Safely verify integrity, check duplicate/collision, and copy to Google Drive destination."""
     check_cancellation(cancel_event)
 
     if not os.path.exists(temp_path):
@@ -286,7 +329,6 @@ def finalize_to_drive(
     target_filename = safe_filename(filename)
     target_path = os.path.join(destination, target_filename)
 
-    # Transition to verifying in state machine
     state_store.update_job(
         job_id,
         status="verifying",
@@ -357,7 +399,6 @@ def finalize_to_drive(
                 f"فشل التحقق من تكامل الملف في درايف: المصدر ({source_sha}, {source_size}) != الهدف ({dest_sha}, {dest_size})"
             )
 
-        # Atomic promotion
         os.replace(dest_part_path, target_path)
 
     except Exception:

@@ -30,6 +30,10 @@ class Config:
     FILE2URL_TIMEOUT: int = 120
     PROGRESS_INTERVAL: float = 3.0  # seconds between Telegram message progress edits
     STATUS_HISTORY_COUNT: int = 5   # number of recent jobs to show in /status and /history
+    MAX_DOWNLOAD_SIZE: int = 100 * 1024 * 1024 * 1024  # 100 GB sanity ceiling
+    MAX_REDIRECTS: int = 10         # Maximum HTTP redirects allowed
+    CONNECT_TIMEOUT: int = 15       # Connection timeout in seconds
+    READ_TIMEOUT: int = 60          # Socket read timeout in seconds
 
     @classmethod
     def from_env(cls) -> Config:
@@ -56,4 +60,8 @@ class Config:
             FILE2URL_TIMEOUT=int(_get_val("FILE2URL_TIMEOUT", "120")),
             PROGRESS_INTERVAL=float(_get_val("PROGRESS_INTERVAL", "3.0")),
             STATUS_HISTORY_COUNT=int(_get_val("STATUS_HISTORY_COUNT", "5")),
+            MAX_DOWNLOAD_SIZE=int(_get_val("MAX_DOWNLOAD_SIZE", str(100 * 1024 * 1024 * 1024))),
+            MAX_REDIRECTS=int(_get_val("MAX_REDIRECTS", "10")),
+            CONNECT_TIMEOUT=int(_get_val("CONNECT_TIMEOUT", "15")),
+            READ_TIMEOUT=int(_get_val("READ_TIMEOUT", "60")),
         )
