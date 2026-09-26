@@ -130,7 +130,9 @@ def download_url(
 
     Error Classification:
     - Non-retryable: 400, 401, 403, 404, 405, 410, HTML landing pages, zero-byte file, user cancellation.
+      (Raises NonRetryableTransferError immediately without burning subsequent attempts).
     - Retryable: 408 (Request Timeout), 429 (Too Many Requests), 5xx (Server Errors), connection drops, chunk timeouts.
+      (Retried up to max_retries).
     """
     os.makedirs(temp_root, exist_ok=True)
     last_error: Optional[Exception] = None
@@ -259,7 +261,18 @@ def finalize_to_drive(
     job_id: str,
     cancel_event: Optional[Any] = None,
 ) -> FinalizeResult:
-    """Safely verify integrity, check duplicate/collision, and copy to Google Drive destination."""
+    """Safely verify integrity, check duplicate/collision, and copy to Google Drive destination.
+
+    Crash-Safety Invariant:
+    1. Pre-copy source validation & state transition to 'verifying'.
+    2. Content duplicate detection (exact SHA-256 and size match avoids redundant transfer).
+    3. Collision renaming (safely appends suffix if differing content exists).
+    4. Copy to .part_<job_id>_<filename> in destination.
+    5. Post-copy cryptographic verification (SHA-256 + size match).
+    6. Atomic promotion (os.replace).
+    7. State transition to 'completed'.
+    8. Local staging file removal.
+    """
     check_cancellation(cancel_event)
 
     if not os.path.exists(temp_path):

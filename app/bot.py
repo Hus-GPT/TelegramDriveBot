@@ -429,7 +429,16 @@ class TelegramDriveBotApp:
                         pass
 
     def restore_unfinished(self) -> None:
-        """Deterministically restore incomplete jobs on startup without violating state machine."""
+        """Deterministically restore incomplete jobs on startup without violating state machine.
+
+        Recovery Rules:
+        - clean_orphan_drive_partials removes lingering .part_<job_id>_* for terminal/absent jobs.
+        - 'queued' or 'downloading': Interrupted staging is purged and job safely requeued.
+        - 'downloaded': If local staging exists and matches sha256 + size, retained as 'downloaded'
+          to avoid re-download. If missing or corrupt, recovered to 'queued'.
+        - 'verifying': Drive .part is purged. If local staging exists and valid, recovered to 'downloaded'
+          to re-attempt Drive finalization. Otherwise recovered to 'queued'.
+        """
         dest_dir = self.config.DRIVE_DESTINATION
         clean_orphan_drive_partials(dest_dir, self.state)
 

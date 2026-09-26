@@ -373,6 +373,19 @@ def test_restore_unfinished_branches(temp_dirs):
     app.state.update_job("j_lost", status="downloading")
     app.state.update_job("j_lost", status="downloaded", temp_path=os.path.join(staging, "missing.bin"))
 
+    # Branch 4: verifying job with valid temp_path and leftover Drive .part -> cleans .part and recovers to downloaded
+    dest_part = os.path.join(drive, ".part_j_ver_valid2.bin")
+    with open(dest_part, "wb") as f:
+        f.write(b"leftover dest part")
+    valid_stage2 = os.path.join(staging, "valid2.bin")
+    with open(valid_stage2, "wb") as f:
+        f.write(b"intact content 2")
+    v_sha2, v_size2 = hash_file(valid_stage2)
+    app.state.add_job("j_ver", "direct_url", "valid2.bin", 1, 2)
+    app.state.update_job("j_ver", status="downloading")
+    app.state.update_job("j_ver", status="downloaded")
+    app.state.update_job("j_ver", status="verifying", temp_path=valid_stage2, sha256=v_sha2, size=v_size2)
+
     app.restore_unfinished()
 
     assert not os.path.exists(part_stage)
@@ -382,6 +395,9 @@ def test_restore_unfinished_branches(temp_dirs):
     assert os.path.exists(valid_stage)
 
     assert app.state.get_job("j_lost")["status"] == "queued"
+
+    assert not os.path.exists(dest_part)
+    assert app.state.get_job("j_ver")["status"] == "downloaded"
 
 
 # ---------------------------------------------------------
@@ -546,12 +562,10 @@ def test_owner_authorization(temp_dirs):
     )
     app = TelegramDriveBotApp(cfg)
 
-    # Authorized user
     mock_auth_update = MagicMock()
     mock_auth_update.effective_user.id = 999888
     assert app.is_authorized(mock_auth_update) is True
 
-    # Unauthorized user
     mock_unauth_update = MagicMock()
     mock_unauth_update.effective_user.id = 111222
     assert app.is_authorized(mock_unauth_update) is False

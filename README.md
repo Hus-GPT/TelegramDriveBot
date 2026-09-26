@@ -26,19 +26,19 @@ Job Creation (StateStore: queued)
 Single-Worker Async Queue
     │
     ▼
-Streamed Download to Local Staging (/tmp/...)
-    │
-    ▼
-Source SHA-256 + Size Computation (StateStore: downloaded)
-    │
-    ▼
-Google Drive Verification & Copy (.part_<job_id> landing)
-    │
-    ▼
-Destination SHA-256 + Size Match (StateStore: completed)
-    │
-    ▼
-Staging File Cleanup
+Worker Thread Pool:
+  1. Status -> "downloading"
+  2. Streamed download in 1 MB chunks to /tmp/... (Staging)
+  3. Pre-transfer Source Verification (SHA-256 + Byte Size)
+  4. Status -> "downloaded"
+  5. Check existing target on Drive:
+     ├─ Exact Match (SHA-256 + Size) -> Status: "completed" (duplicate_skipped)
+     └─ Name collision -> Target renamed to "file (N).ext"
+  6. Copy to Drive staging: ".part_<job_id>_<filename>"
+  7. Post-transfer Destination Verification (SHA-256 + Byte Size match)
+  8. Atomic rename of ".part_<job_id>_<filename>" -> Target Path
+  9. Status -> "completed"
+ 10. Guaranteed cleanup of staging file
 ```
 
 ## Running Tests
@@ -46,5 +46,7 @@ Staging File Cleanup
 Automated tests run locally without requiring Telegram tokens or real Google Drive mounts:
 
 ```bash
-pytest tests/
+pytest -q
 ```
+
+Actual test suite inventory: 13 top-level test functions in `tests/test_core.py`.
