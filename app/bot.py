@@ -30,8 +30,10 @@ from app.transfer import (
     download_url,
     extract_filename_from_url,
     finalize_to_drive,
+    get_storage_diagnostics,
     hash_file,
     safe_filename,
+    validate_destination_directory,
     validate_url_security,
 )
 from app.ui import ProgressTracker, format_bytes, humanize_error
@@ -144,6 +146,7 @@ class TelegramDriveBotApp:
             "• أرسل أي ملف، فيديو، مستند، أو صوت عبر تيليجرام\n\n"
             "📋 *الأوامر التشغيلية:*\n"
             "/status — عرض حالة النقل الحالية والعمليات الجارية\n"
+            "/storage — تشخيص حالة التخزين ومجلد Google Drive\n"
             "/history — استعراض أحدث المهام المكتملة والفاشلة\n"
             "/cancel — إلغاء العملية الجارية، أو `/cancel <معرّف>`\n"
             "/retry <معرّف> — إعادة تشغيل مهمة فاشلة أو ملغاة\n"
@@ -158,6 +161,7 @@ class TelegramDriveBotApp:
         msg = (
             "📖 *دليل أوامر TelegramDriveBot:*\n\n"
             "• `/status` : تقرير شامل عن العمليات النشطة، طابور الانتظار، وإحصائيات النقل.\n"
+            "• `/storage` : فحص حالة تثبيت Google Drive وصلاحية الكتابة ومساحة Staging المحلية.\n"
             "• `/history` : عرض سجل بآخر العمليات المنتهية (الناجحة والفاشلة).\n"
             "• `/cancel` : إلغاء العملية الجارية فوراً.\n"
             "• `/cancel <معرّف>` : إلغاء مهمة محددة بالاسم (سواء جارية أو بقائمة الانتظار).\n"
@@ -204,6 +208,31 @@ class TelegramDriveBotApp:
         if not active:
             report += "✨ لا توجد عمليات جارية حالياً."
 
+        await update.effective_message.reply_text(report, parse_mode="Markdown")
+
+    async def cmd_storage(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Operational storage diagnostics command (Milestone 4)."""
+        if not await self.check_auth_or_reject(update):
+            return
+
+        diag = get_storage_diagnostics(self.config.LOCAL_STAGING_DIR, self.config.DRIVE_DESTINATION)
+
+        mount_status = "✅ متصل (Mounted)" if diag.is_mount_likely else "⚠️ غير مؤكد أو غير متصل"
+        drive_write = "✅ متاح للكتابة" if diag.drive_writable else "❌ غير متاح للكتابة أو محمي"
+        stg_free_str = format_bytes(diag.staging_free_bytes)
+
+        report = (
+            "💽 *تشخيص وسائط التخزين (Storage Intelligence)*\n\n"
+            "☁️ *Google Drive Destination:*\n"
+            f"• المسار: `{diag.drive_path}`\n"
+            f"• حالة التثبيت: {mount_status}\n"
+            f"• إمكانية الكتابة: {drive_write}\n\n"
+            "📦 *Local Staging (Colab VM):*\n"
+            f"• المسار: `{diag.staging_path}`\n"
+            f"• المساحة الحرة بالقرص المحلي: `{stg_free_str}`\n"
+            f"• الحد الأقصى المسموح للملف: `{format_bytes(self.config.MAX_DOWNLOAD_SIZE)}`\n\n"
+            "💡 *ملاحظة:* سعة Google Drive السحابية تُدار عبر حسابك وليست قرصاً محلياً مباشراً."
+        )
         await update.effective_message.reply_text(report, parse_mode="Markdown")
 
     async def cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -461,6 +490,9 @@ class TelegramDriveBotApp:
         try:
             loop = asyncio.get_running_loop()
 
+            # Pre-validate destination directory before starting heavy network operations
+            await loop.run_in_executor(None, validate_destination_directory, dest_dir)
+
             skip_download = False
             if job.get("status") == "downloaded" and temp_file_path and os.path.exists(temp_file_path):
                 try:
@@ -701,6 +733,7 @@ class TelegramDriveBotApp:
         self.application.add_handler(CommandHandler("start", self.cmd_start))
         self.application.add_handler(CommandHandler("help", self.cmd_help))
         self.application.add_handler(CommandHandler("status", self.cmd_status))
+        self.application.add_handler(CommandHandler("storage", self.cmd_storage))
         self.application.add_handler(CommandHandler("history", self.cmd_history))
         self.application.add_handler(CommandHandler("cancel", self.cmd_cancel))
         self.application.add_handler(CommandHandler("retry", self.cmd_retry))

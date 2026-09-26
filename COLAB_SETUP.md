@@ -31,9 +31,10 @@ In the left sidebar of Google Colab, open **Secrets** (key icon) and set:
 * `TELEGRAM_BOT_TOKEN`: The API token from `@BotFather`.
 * `OWNER_ID`: Your numerical Telegram user ID (from `@userinfobot`).
 
-## Operational Commands (Milestones 2 & 3)
+## Operational Commands (Milestones 2, 3 & 4)
 
 * `/status` : View real-time bot state, active job, queue count, and transfer metrics.
+* `/storage` : View storage diagnostics (Google Drive destination writability, mount status, local staging disk capacity).
 * `/history` : Review recent completed, failed, and cancelled transfer history.
 * `/cancel` : Safely cancel the currently active transfer, or specify a job ID via `/cancel <job_id>`.
 * `/retry <job_id>` : Requeue failed or cancelled transfers with original metadata.
@@ -45,9 +46,17 @@ In the left sidebar of Google Colab, open **Secrets** (key icon) and set:
 * **Security & SSRF Mitigation:** Automatically rejects loopback (`127.0.0.1`, `localhost`), link-local, private subnets (`10.x`, `192.168.x`), and cloud metadata IP endpoints upfront.
 * **Redirects & Filename Precedence:** Safely follows HTTP redirects (up to 10) and determines target filenames with strict precedence (`custom_filename` $\to$ RFC 5987 / 6266 `Content-Disposition` $\to$ URL path $\to$ fallback) while sanitizing against path traversal and preserving Unicode/Arabic characters.
 * **Fail-Fast Error Classification:**
-  * Non-retryable: 400, 401, 403, 404, 405, 410, SSRF rejection, HTML landing pages, 0-byte responses, and user cancellations fail immediately without burning retries.
+  * Non-retryable: 400, 401, 403, 404, 405, 410, SSRF rejection, HTML landing pages, 0-byte responses, unmounted/unwritable Drive destination, and user cancellations fail immediately without burning retries.
   * Retryable: 408, 429, 5xx server errors, connection resets, and chunk read timeouts cleanly retry up to `MAX_RETRIES`.
 * **Clean Retry Semantics (No Resume):** Incomplete partial downloads are discarded upon failure or cancellation; retries restart clean streams from byte 0 to prevent byte corruption.
+
+## Google Drive Storage & Finalization (Milestone 4)
+
+* **Destination Pre-Validation:** Before starting network streams or finalization, `validate_destination_directory` verifies that the Drive folder exists, is a valid directory, and passes a physical write/unlink probe. If Google Drive is unmounted (`/content/drive/MyDrive` missing), the job fails fast with a clear instruction to mount Drive.
+* **Storage Intelligence (`/storage`):** Reports whether the Drive mount is ready and writable, alongside free space on the local staging filesystem (`/tmp`). Note: Google Drive cloud quota is managed by Google Workspace and is distinct from local filesystem storage.
+* **Two-Point Cryptographic Verification:** Incremental SHA-256 and byte-size matching computed both on local staging and upon destination `.part_<job_id>_*` landing before destination promotion via `os.replace`.
+* **Duplicate & Collision Safety:** Exact SHA-256 matches skip redundant copying (`duplicate_skipped`); different content with identical names receives sequential collision suffixes (`file (1).ext`).
+* **Scoped Orphan Cleanup:** Startup recovery removes only `.part_<job_id>_*` files whose associated job is terminal or absent from `StateStore`. Valid files and user folders are never touched.
 
 ## How Persistence & Recovery Work
 

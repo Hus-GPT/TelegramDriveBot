@@ -41,12 +41,110 @@ class RetryableTransferError(TransferError):
 
 
 @dataclass
+class StorageDiagnostics:
+    staging_path: str
+    staging_exists: bool
+    staging_writable: bool
+    staging_free_bytes: Optional[int]
+    drive_path: str
+    drive_exists: bool
+    drive_is_dir: bool
+    drive_writable: bool
+    is_mount_likely: bool
+
+
+@dataclass
 class FinalizeResult:
     destination_path: str
     sha256: str
     size: int
     is_duplicate: bool
     action: str  # "copied", "duplicate_skipped", "collision_renamed"
+
+
+def validate_destination_directory(destination: str) -> str:
+    """Validate that Google Drive destination exists or can be created, is a directory, and is writable."""
+    dest_path = os.path.abspath(destination)
+
+    if os.path.exists(dest_path):
+        if not os.path.isdir(dest_path):
+            raise NonRetryableTransferError(f"مسار التخزين المحدد ليس مجلداً صالحاً: {dest_path}")
+        if not os.access(dest_path, os.W_OK | os.X_OK):
+            raise NonRetryableTransferError(f"لا توجد صلاحية كتابة في مجلد Google Drive: {dest_path}")
+    else:
+        # Check parent directory accessibility
+        parent = os.path.dirname(dest_path)
+        if not os.path.exists(parent):
+            # If standard Colab mount path parent /content/drive/MyDrive is missing
+            if "/content/drive" in dest_path and not os.path.exists("/content/drive/MyDrive"):
+                raise NonRetryableTransferError(
+                    "وحدة تخزين Google Drive غير مثبتة (Unmounted)! يرجى تنفيذ drive.mount('/content/drive') في كولاب أولاً."
+                )
+        try:
+            os.makedirs(dest_path, exist_ok=True)
+        except OSError as exc:
+            raise NonRetryableTransferError(f"تعذر إنشاء مجلد الوجهة في Google Drive ({exc}): {dest_path}") from exc
+
+    # Probe writability with a volatile test file
+    test_probe = os.path.join(dest_path, f".write_probe_{os.getpid()}_{int(hashlib.md5(dest_path.encode()).hexdigest()[:8], 16)}")
+    try:
+        with open(test_probe, "w", encoding="utf-8") as f:
+            f.write("probe")
+        os.remove(test_probe)
+    except OSError as exc:
+        if os.path.exists(test_probe):
+            try:
+                os.remove(test_probe)
+            except OSError:
+                pass
+        raise NonRetryableTransferError(f"فحص الكتابة فشل؛ مجلد Google Drive غير متاح للكتابة: {exc}") from exc
+
+    return dest_path
+
+
+def get_storage_diagnostics(staging_dir: str, drive_dir: str) -> StorageDiagnostics:
+    """Inspect local staging and Google Drive storage availability without assuming universal FUSE quotas."""
+    staging_path = os.path.abspath(staging_dir)
+    drive_path = os.path.abspath(drive_dir)
+
+    # 1. Staging evaluation
+    stg_exists = os.path.exists(staging_path)
+    stg_writable = False
+    stg_free: Optional[int] = None
+    if stg_exists and os.path.isdir(staging_path):
+        stg_writable = os.access(staging_path, os.W_OK)
+        try:
+            usage = shutil.disk_usage(staging_path)
+            stg_free = usage.free
+        except OSError:
+            pass
+
+    # 2. Drive evaluation
+    drv_exists = os.path.exists(drive_path)
+    drv_is_dir = os.path.isdir(drive_path) if drv_exists else False
+    drv_writable = False
+    if drv_exists and drv_is_dir:
+        drv_writable = os.access(drive_path, os.W_OK | os.X_OK)
+
+    # Mount detection heuristic for Colab runtime
+    is_mount = False
+    if "/content/drive" in drive_path:
+        is_mount = os.path.exists("/content/drive/MyDrive")
+    else:
+        # Generic local/POSIX destination
+        is_mount = drv_exists and drv_is_dir
+
+    return StorageDiagnostics(
+        staging_path=staging_path,
+        staging_exists=stg_exists,
+        staging_writable=stg_writable,
+        staging_free_bytes=stg_free,
+        drive_path=drive_path,
+        drive_exists=drv_exists,
+        drive_is_dir=drv_is_dir,
+        drive_writable=drv_writable,
+        is_mount_likely=is_mount,
+    )
 
 
 def validate_url_security(url: str) -> None:
@@ -62,18 +160,15 @@ def validate_url_security(url: str) -> None:
     if not hostname:
         raise NonRetryableTransferError("الرابط غير صالح: لا يحتوي على اسم مضيف (hostname).")
 
-    # Block well-known loopback names
     lower_host = hostname.lower().strip("[]")
     if lower_host in {"localhost", "127.0.0.1", "::1", "metadata.google.internal", "metadata.local"}:
         raise NonRetryableTransferError("محظور: لا يمكن تحميل عناوين الخوادم المحلية أو خدمات البيانات الوصفية (SSRF Protection).")
 
-    # Check if host is direct IP address and block private/link-local/loopback
     try:
         ip = ipaddress.ip_address(lower_host)
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
             raise NonRetryableTransferError("محظور: لا يمكن التحميل من نطاقات الشبكة الداخلية أو الخاصة (SSRF Protection).")
     except ValueError:
-        # Hostname is a domain name, proceed normally
         pass
 
 
@@ -82,15 +177,9 @@ def safe_filename(name: str, fallback: str = "download.bin") -> str:
     if not name:
         return fallback
 
-    # Strip URL fragments / query parameters if accidentally passed
     cleaned = name.split("?")[0].split("#")[0]
     cleaned = os.path.basename(cleaned)
-
-    # Remove dangerous filesystem and path traversal characters
-    # Preserve Unicode letters (e.g. Arabic, Persian, etc.), digits, spaces, dots, dashes, underscores
     cleaned = re.sub(r'[\x00-\x1f\\/:\*\?"<>\|]', "_", cleaned)
-
-    # Strip leading/trailing dots and whitespace
     cleaned = cleaned.strip(". \t\r\n")
     if not cleaned or cleaned in {".", ".."}:
         return fallback
@@ -114,7 +203,6 @@ def parse_content_disposition(header: str) -> Optional[str]:
     if not header:
         return None
 
-    # Try filename* (UTF-8) first (RFC 5987)
     match_star = re.search(r"filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;]+)", header, re.IGNORECASE)
     if match_star:
         val = match_star.group(1).strip("\"' ")
@@ -124,7 +212,6 @@ def parse_content_disposition(header: str) -> Optional[str]:
         except Exception:
             pass
 
-    # Standard filename="..."
     match_standard = re.search(r'filename\s*=\s*"([^"]+)"', header, re.IGNORECASE)
     if not match_standard:
         match_standard = re.search(r'filename\s*=\s*([^; ]+)', header, re.IGNORECASE)
@@ -165,18 +252,7 @@ def download_url(
     max_download_size: int = MAX_STREAM_SIZE,
     max_redirects: int = MAX_REDIRECTS,
 ) -> Tuple[str, str, int]:
-    """Stream download a direct URL into a local temporary staging file safely.
-
-    Hardened Features (Milestone 3):
-    - Strict SSRF and URL validation before issuing requests.
-    - Full HTTP redirect following (up to max_redirects) with safety enforcement.
-    - Size ceiling validation: rejects files where Content-Length exceeds max_download_size before starting.
-    - True streaming in 1 MB chunks without buffering in RAM.
-    - Zero-byte payload rejection.
-    - HTML landing page detection and rejection.
-    - Instant cancellation response with immediate unlinking of the partial staging file.
-    - Clean retry semantics: restarting cleanly from byte 0 per attempt (no corrupt appended partials).
-    """
+    """Stream download a direct URL into a local temporary staging file safely."""
     validate_url_security(url)
     os.makedirs(temp_root, exist_ok=True)
     last_error: Optional[Exception] = None
@@ -194,22 +270,19 @@ def download_url(
                 stream=True,
                 allow_redirects=True,
                 timeout=timeout,
-                headers={"User-Agent": "TelegramDriveBot/3.0"},
+                headers={"User-Agent": "TelegramDriveBot/4.0"},
             )
 
-            # Strict error classification
             if response.status_code in {400, 401, 403, 404, 405, 410}:
                 raise NonRetryableTransferError(f"فشل التحميل (رمز HTTP غير قابل لإعادة المحاولة: {response.status_code})")
             if response.status_code in {408, 429} or response.status_code >= 500:
                 raise RetryableTransferError(f"خطأ مؤقت قابل لإعادة المحاولة (HTTP {response.status_code})")
             response.raise_for_status()
 
-            # Reject HTML landing pages masquerading as direct downloads
             content_type = response.headers.get("Content-Type", "").lower()
             if "text/html" in content_type and not (custom_filename and custom_filename.endswith(".html")):
                 raise NonRetryableTransferError("الرابط يشير إلى صفحة ويب (HTML) وليس إلى ملف تحميل مباشر.")
 
-            # Validate Content-Length if provided
             content_length_hdr = response.headers.get("Content-Length")
             total_expected: Optional[int] = None
             if content_length_hdr and content_length_hdr.strip().isdigit():
@@ -219,7 +292,6 @@ def download_url(
                         f"حجم الملف ({total_expected} بايت) يتجاوز الحد الأقصى المسموح به للنظام ({max_download_size} بايت)."
                     )
 
-            # Resolve filename (Priority: custom_filename -> Content-Disposition -> URL path -> safe fallback)
             cd_name = parse_content_disposition(response.headers.get("Content-Disposition", ""))
             resolved_filename = (
                 safe_filename(custom_filename)
@@ -281,7 +353,13 @@ def download_url(
 
 
 def clean_orphan_drive_partials(destination_dir: str, state_store: Any) -> List[str]:
-    """Safely removes only orphaned .part_<job_id>_* files from Google Drive destination."""
+    """Safely removes only orphaned .part_<job_id>_* files from Google Drive destination.
+
+    A partial file is an orphan IF AND ONLY IF:
+    1. It strictly matches the project-specific naming convention '.part_<job_id>_*'
+    2. The associated job does not exist in StateStore, OR the job is in a terminal state (completed, failed, cancelled).
+    Never touches any valid destination files or unrelated files.
+    """
     cleaned: List[str] = []
     if not os.path.exists(destination_dir):
         return cleaned
@@ -315,19 +393,33 @@ def finalize_to_drive(
     job_id: str,
     cancel_event: Optional[Any] = None,
 ) -> FinalizeResult:
-    """Safely verify integrity, check duplicate/collision, and copy to Google Drive destination."""
+    """Safely verify integrity, validate destination, check duplicate/collision, and copy to Google Drive destination.
+
+    Hardened Drive Architecture:
+    1. Pre-transfer destination validation (existence, directory, writability probe).
+    2. Pre-copy source validation & state transition to 'verifying'.
+    3. Content duplicate detection (exact SHA-256 and size match avoids redundant transfer).
+    4. Collision renaming (safely appends suffix if differing content exists).
+    5. Copy to .part_<job_id>_<filename> in destination.
+    6. Post-copy cryptographic verification (destination SHA-256 + size match).
+    7. Destination promotion via os.replace.
+    8. State transition to 'completed'.
+    9. Local staging file removal.
+    """
     check_cancellation(cancel_event)
 
     if not os.path.exists(temp_path):
         raise NonRetryableTransferError(f"الملف المؤقت المصدر غير موجود: {temp_path}")
 
+    # Validate destination directory writability upfront
+    dest_path = validate_destination_directory(destination)
+
     source_sha, source_size = hash_file(temp_path)
     if source_size == 0:
         raise NonRetryableTransferError("الملف المؤقت فارغ (حجمه صفر).")
 
-    os.makedirs(destination, exist_ok=True)
     target_filename = safe_filename(filename)
-    target_path = os.path.join(destination, target_filename)
+    target_path = os.path.join(dest_path, target_filename)
 
     state_store.update_job(
         job_id,
@@ -383,12 +475,12 @@ def finalize_to_drive(
             except OSError:
                 pass
             target_filename = f"{stem} ({counter}){ext}"
-            target_path = os.path.join(destination, target_filename)
+            target_path = os.path.join(dest_path, target_filename)
             counter += 1
 
     check_cancellation(cancel_event)
 
-    dest_part_path = os.path.join(destination, f".part_{job_id}_{target_filename}")
+    dest_part_path = os.path.join(dest_path, f".part_{job_id}_{target_filename}")
     try:
         shutil.copyfile(temp_path, dest_part_path)
         check_cancellation(cancel_event)

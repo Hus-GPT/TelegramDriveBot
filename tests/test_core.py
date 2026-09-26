@@ -1,4 +1,4 @@
-"""Comprehensive automated test suite for TelegramDriveBot Core Reliability, UX & Milestone 3 Download Hardening."""
+"""Comprehensive automated test suite for TelegramDriveBot Core Reliability, UX & Milestone 4 Drive Intelligence."""
 
 import asyncio
 import hashlib
@@ -19,9 +19,11 @@ from app.transfer import (
     download_url,
     extract_filename_from_url,
     finalize_to_drive,
+    get_storage_diagnostics,
     hash_file,
     parse_content_disposition,
     safe_filename,
+    validate_destination_directory,
     validate_url_security,
 )
 from app.bot import File2URLProvider, TelegramDriveBotApp
@@ -776,21 +778,18 @@ async def test_ui_failure_isolation():
     assert res is False
 
 
-# =========================================================
-# MILESTONE 3: Download Engine Hardening Tests
-# =========================================================
+# ---------------------------------------------------------
+# 10. Download Engine Hardening (Milestone 3)
+# ---------------------------------------------------------
 
 def test_url_security_ssrf_and_schemes():
-    # Valid external URLs
     validate_url_security("https://example.com/file.zip")
     validate_url_security("http://cdn.example.org:8080/data?key=123")
 
-    # Invalid scheme
     with pytest.raises(NonRetryableTransferError) as exc:
         validate_url_security("ftp://example.com/file.zip")
     assert "غير مدعوم" in str(exc.value)
 
-    # Localhost / loopback
     with pytest.raises(NonRetryableTransferError):
         validate_url_security("http://localhost/admin")
     with pytest.raises(NonRetryableTransferError):
@@ -798,11 +797,9 @@ def test_url_security_ssrf_and_schemes():
     with pytest.raises(NonRetryableTransferError):
         validate_url_security("http://[::1]/secret")
 
-    # Cloud metadata endpoints
     with pytest.raises(NonRetryableTransferError):
         validate_url_security("http://metadata.google.internal/computeMetadata/v1/")
 
-    # Private IP subnets
     with pytest.raises(NonRetryableTransferError):
         validate_url_security("http://10.0.0.1/file")
     with pytest.raises(NonRetryableTransferError):
@@ -835,7 +832,6 @@ def test_download_streaming_and_content_length_limit(temp_dirs):
             for c in self._chunks:
                 yield c
 
-    # 1. Successful streamed download
     with patch("requests.Session.get", return_value=MockResponse(headers={"Content-Length": "18"})):
         path, fname, size = download_url("https://example.com/stream.bin", staging)
         assert os.path.exists(path)
@@ -843,13 +839,11 @@ def test_download_streaming_and_content_length_limit(temp_dirs):
         assert fname == "stream.bin"
         os.remove(path)
 
-    # 2. Exceeding max_download_size via Content-Length header upfront
     with patch("requests.Session.get", return_value=MockResponse(headers={"Content-Length": "1000"})):
         with pytest.raises(NonRetryableTransferError) as exc:
             download_url("https://example.com/stream.bin", staging, max_download_size=500)
         assert "يتجاوز الحد الأقصى" in str(exc.value)
 
-    # 3. Exceeding max_download_size dynamically during chunk streaming
     with patch("requests.Session.get", return_value=MockResponse(headers={}, chunks=[b"a" * 300, b"b" * 300])):
         with pytest.raises(NonRetryableTransferError) as exc:
             download_url("https://example.com/stream.bin", staging, max_download_size=500)
@@ -871,7 +865,6 @@ def test_download_cancellation_during_streaming_cleans_partial(temp_dirs):
 
         def iter_content(self, chunk_size=1024):
             yield b"first chunk"
-            # Cancel in middle of stream
             cancel_evt.set()
             yield b"second chunk"
 
@@ -880,7 +873,6 @@ def test_download_cancellation_during_streaming_cleans_partial(temp_dirs):
             download_url("https://example.com/large.bin", staging, cancel_event=cancel_evt)
         assert "تم إلغاء عملية النقل" in str(exc.value)
 
-    # Ensure no leftover .part file was leaked in staging
     staged_files = os.listdir(staging)
     assert len(staged_files) == 0
 
@@ -912,3 +904,71 @@ def test_download_redirect_and_content_disposition_precedence(temp_dirs):
         assert resolved_name == "final_document.pdf"
         assert size == 13
         os.remove(path)
+
+
+# =========================================================
+# MILESTONE 4: Drive Storage Intelligence & Validation
+# =========================================================
+
+def test_validate_destination_directory_success(temp_dirs):
+    _, drive = temp_dirs
+    target_sub = os.path.join(drive, "subfolder", "target")
+    # Must create directory and probe write
+    validated = validate_destination_directory(target_sub)
+    assert os.path.exists(validated)
+    assert os.path.isdir(validated)
+
+
+def test_validate_destination_directory_is_file(temp_dirs):
+    _, drive = temp_dirs
+    file_path = os.path.join(drive, "some_file.txt")
+    with open(file_path, "w") as f:
+        f.write("I am a file")
+
+    with pytest.raises(NonRetryableTransferError) as exc:
+        validate_destination_directory(file_path)
+    assert "ليس مجلداً صالحاً" in str(exc.value)
+
+
+def test_validate_destination_unmounted_colab():
+    with pytest.raises(NonRetryableTransferError) as exc:
+        validate_destination_directory("/content/drive/MyDrive/NonExistentTestDir")
+    assert "غير مثبتة" in str(exc.value) or "Unmounted" in str(exc.value)
+
+
+def test_get_storage_diagnostics(temp_dirs):
+    staging, drive = temp_dirs
+    diag = get_storage_diagnostics(staging, drive)
+
+    assert diag.staging_exists is True
+    assert diag.staging_writable is True
+    assert diag.staging_free_bytes is not None
+    assert diag.staging_free_bytes > 0
+    assert diag.drive_exists is True
+    assert diag.drive_is_dir is True
+    assert diag.drive_writable is True
+
+
+@pytest.mark.asyncio
+async def test_cmd_storage(temp_dirs):
+    staging, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=777,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+
+    update = MagicMock()
+    update.effective_user.id = 777
+    update.effective_message.reply_text = AsyncMock()
+    context = MagicMock()
+
+    await app.cmd_storage(update, context)
+    update.effective_message.reply_text.assert_called_once()
+    msg = update.effective_message.reply_text.call_args[0][0]
+    assert "تشخيص وسائط التخزين" in msg
+    assert "Google Drive Destination" in msg
+    assert "Local Staging" in msg

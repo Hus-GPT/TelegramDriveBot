@@ -46,6 +46,16 @@ def humanize_error(exc: Exception) -> str:
     if "تم إلغاء عملية النقل بواسطة المستخدم" in msg or "cancelled" in msg.lower():
         return "تم إلغاء العملية بأمر منك."
 
+    if "وحدة تخزين Google Drive غير مثبتة" in msg or "Unmounted" in msg:
+        return "وحدة تخزين Google Drive غير متصلة بالجلسة. يرجى تفعيل drive.mount في كولاب أولاً."
+    if "لا توجد صلاحية كتابة في مجلد" in msg or "غير متاح للكتابة" in msg:
+        return "مجلد الوجهة في Google Drive محمي أو لا توجد صلاحيات كتابة فيه."
+    if "ليس مجلداً صالحاً" in msg:
+        return "مسار الحفظ المحدد في Google Drive غير صالح."
+
+    if "SSRF Protection" in msg or "محظور: لا يمكن تحميل عناوين" in msg or "نطاقات الشبكة الداخلية" in msg:
+        return "تم حظر الرابط لأسباب أمنية (الرابط يشير إلى خادم محلي أو شبكة خاصة محظورة)."
+
     if "404" in msg:
         return "الرابط المطلوب غير موجود أو تم حذفه من المصدر (رمز 404)."
     if "403" in msg or "401" in msg:
@@ -57,6 +67,9 @@ def humanize_error(exc: Exception) -> str:
         return "الرابط يشير إلى صفحة ويب (HTML) وليس إلى ملف تنزيل مباشر."
     if "صفر بايت" in msg or "empty" in msg.lower():
         return "الملف المستلم فارغ من المصدر (حجمه صفر بايت)."
+
+    if "يتجاوز الحد الأقصى المسموح" in msg:
+        return "حجم الملف المطلوب يتجاوز الحد الأقصى المسموح بتنزيله في إعدادات النظام."
 
     if "File2URL" in msg or "مهلة انتظار" in msg:
         return "تعذر استخراج رابط الملف الكبير عبر خدمة التحويل الخارجي (انتهت المهلة أو الخدمة متوقفة)."

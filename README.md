@@ -2,12 +2,13 @@
 
 A lightweight, reliable Telegram bot designed to safely stream direct downloads and media files directly into Google Drive from within a Google Colab session.
 
-## Core Capabilities (Milestones 1, 2 & 3)
+## Core Capabilities (Milestones 1, 2, 3 & 4)
 
 * **Hardened Direct URL Streaming:** Streams downloads directly into local Colab staging in 1 MB chunks without loading entire files into RAM.
 * **Security & SSRF Mitigation:** Protects against private IPs, localhost, and cloud metadata service extraction.
+* **Google Drive Pre-Validation & Diagnostics:** Validates Drive mount status and writability before downloading; provides `/storage` diagnostics.
 * **Telegram Media Acquisition:** Handles Telegram native documents, audio, and video up to 20MB directly via Bot API, and forwards larger media through File2URL.
-* **Operational Bot UX & Controls:** Full owner-only control via `/start`, `/status`, `/history`, `/cancel`, `/retry`, and `/help`.
+* **Operational Bot UX & Controls:** Full owner-only control via `/start`, `/status`, `/storage`, `/history`, `/cancel`, `/retry`, and `/help`.
 * **Live Throttled Progress:** Live percentage, transfer speed, and ETA updates debounced to prevent Telegram rate-limiting.
 * **Failure Isolation:** Telegram UI edit failures never crash or interrupt ongoing file transfers.
 * **Integrity Verification:** End-to-end SHA-256 and byte-size verification before and after staging to Google Drive.
@@ -31,8 +32,8 @@ Single-Worker Async Queue
     │
     ▼
 Worker Thread Pool:
-  1. Status -> "downloading" (UI: throttled speed/ETA updates)
-  2. Streamed download in 1 MB chunks to /tmp/... (Staging)
+  1. Status -> "downloading" (Pre-validates Drive destination & checks local staging)
+  2. Streamed download in 1 MB chunks to /tmp/... (Staging, UI throttled speed/ETA updates)
   3. Pre-transfer Source Verification (SHA-256 + Byte Size)
   4. Status -> "downloaded"
   5. Check existing target on Drive:
@@ -53,4 +54,4 @@ Automated tests run locally without requiring Telegram tokens or real Google Dri
 pytest -q
 ```
 
-Actual test suite inventory: exactly 34 top-level test functions in `tests/test_core.py`.
+Actual test suite inventory: exactly 39 top-level test functions in `tests/test_core.py`.
