@@ -1,304 +1,393 @@
+"""Telegram handlers, worker loop, and lifecycle management for TelegramDriveBot."""
+
+from __future__ import annotations
+
 import asyncio
+import logging
 import os
 import re
+import threading
 import uuid
+from typing import Any, Dict, Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ChatAction
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram import Update
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-from .config import Config
-from .state import now
-from .transfer import TransferCancelled, TransferError, download_url, finalize_to_drive, safe_filename
+from app.config import Config
+from app.state import StateStore
+from app.transfer import (
+    NonRetryableTransferError,
+    RetryableTransferError,
+    TransferError,
+    download_url,
+    extract_filename_from_url,
+    finalize_to_drive,
+    safe_filename,
+)
 
-URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
+logger = logging.getLogger(__name__)
+
+URL_REGEX = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
 
-class TelegramDriveBot:
-    def __init__(self, config: Config, state_store):
-        self.config = config
-        self.state = state_store
-        self.queue: asyncio.Queue = asyncio.Queue()
-        self.active_cancel: asyncio.Event | None = None
-        self.file2url_waiter: asyncio.Future | None = None
-        self.file2url_username = os.getenv("FILE2URL_BOT_USERNAME", "@File2url_rbot").strip()
+class File2URLProvider:
+    """Isolated provider for large Telegram files via Bot-to-Bot forward."""
 
-    def authorized(self, update: Update) -> bool:
-        return bool(update.effective_user and update.effective_user.id == self.config.owner_id)
+    def __init__(self, bot_username: str, timeout: int = 120):
+        self.bot_username = bot_username.lstrip("@")
+        self.timeout = timeout
+        self._waiters: Dict[str, asyncio.Future[str]] = {}
+        self._lock = asyncio.Lock()
 
-    async def reject(self, update: Update):
-        if update.effective_chat:
-            await update.effective_chat.send_message("🚫 غير مصرح لك باستخدام هذا البوت.")
-
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self.authorized(update):
-            return await self.reject(update)
-        await update.effective_chat.send_message(
-            "📦 TelegramDriveBot جاهز.\n\nأرسل ملفًا أو رابطًا، وسأنقله إلى Google Drive."
-        )
-
-    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self.authorized(update):
-            return await self.reject(update)
-        if self.active_cancel and not self.active_cancel.is_set():
-            self.active_cancel.set()
-            await update.effective_chat.send_message("🛑 تم طلب إلغاء العملية الحالية.")
-        else:
-            await update.effective_chat.send_message("لا توجد عملية قيد التنفيذ حاليًا.")
-
-    async def enqueue(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self.authorized(update):
-            return await self.reject(update)
-        message = update.effective_message
-        url = self.extract_url(message)
-        media = self.extract_media(message)
-        if not url and not media:
-            return
-
-        job_id = uuid.uuid4().hex
-        job = {
-            "id": job_id,
-            "status": "queued",
-            "created_at": now(),
-            "source": "url" if url else "telegram",
-            "chat_id": update.effective_chat.id,
-            "message_id": message.message_id,
-            "url": url,
-            "filename": media[1] if media else None,
-            "telegram_file_id": media[0] if media else None,
-            "telegram_file_size": media[2] if media else None,
-        }
-        self.state.add_job(job)
-        position = self.queue.qsize() + 1
-        keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("❌ إلغاء العملية الحالية", callback_data="cancel_current")]]
-        )
-        await message.reply_text(
-            f"📥 تمت إضافة الطلب إلى الطابور.\nالترتيب: {position}",
-            reply_markup=keyboard,
-        )
-        await self.queue.put(job)
-
-    async def callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        if not self.authorized(update):
-            return await query.edit_message_text("🚫 غير مصرح لك.")
-        if query.data == "cancel_current":
-            if self.active_cancel and not self.active_cancel.is_set():
-                self.active_cancel.set()
-                await query.edit_message_text("🛑 تم طلب إلغاء العملية الحالية.")
-            else:
-                await query.edit_message_text("لا توجد عملية قيد التنفيذ حاليًا.")
-
-    async def bot_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        message = update.effective_message
-        if not message or not message.from_user or not message.from_user.is_bot:
-            return
-        username = (message.from_user.username or "").lower()
-        expected = self.file2url_username.lstrip("@").lower()
-        if username != expected or not self.file2url_waiter or self.file2url_waiter.done():
-            return
-        text = message.text or message.caption or ""
-        match = URL_RE.search(text)
-        if match:
-            self.file2url_waiter.set_result(match.group(0).rstrip(".,);]"))
-
-    async def worker(self, application: Application):
-        while True:
-            job = await self.queue.get()
-            self.active_cancel = asyncio.Event()
-            try:
-                await self.process_job(application, job)
-            except TransferCancelled as exc:
-                self.state.update_job(job["id"], status="cancelled", error=str(exc))
-                try:
-                    await application.bot.send_message(job["chat_id"], "🛑 تم إلغاء العملية.")
-                except Exception:
-                    pass
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.state.update_job(job["id"], status="failed", error=str(exc))
-                try:
-                    await application.bot.send_message(job["chat_id"], f"❌ فشلت العملية: {exc}")
-                except Exception:
-                    pass
-            finally:
-                self.active_cancel = None
-                self.queue.task_done()
-
-    async def process_job(self, application: Application, job: dict):
-        chat_id = job["chat_id"]
-        job_id = job["id"]
-        self.state.update_job(job_id, status="running")
-        status_message = await application.bot.send_message(chat_id, "⏳ جاري تجهيز الملف…")
-        temp_path = job.get("temp_path") if job.get("temp_path") and os.path.isfile(job["temp_path"]) else None
-        try:
-            self.ensure_not_cancelled()
-            await application.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
-            if temp_path:
-                filename = safe_filename(job.get("filename") or os.path.basename(temp_path))
-                await self.update_status(status_message, "🔄 جاري استكمال الملف المؤقت…")
-            else:
-                source = job.get("source")
-                if source == "url" or (source == "telegram_via_file2url" and job.get("url")):
-                    await self.update_status(status_message, "⬇️ جاري تنزيل المصدر…")
-                    temp_path, filename = await asyncio.to_thread(
-                        download_url,
-                        job["url"],
-                        self.config.temp_root,
-                        self.active_cancel,
-                        self.config.max_retries,
-                    )
-                else:
-                    size = job.get("telegram_file_size")
-                    if size and size > 20 * 1024 * 1024:
-                        await self.update_status(status_message, "🔗 الملف كبير؛ جاري تمريره لمسار الرابط…")
-                        url = await self.request_file_url(application, job)
-                        self.ensure_not_cancelled()
-                        job["source"] = "telegram_via_file2url"
-                        self.state.update_job(job_id, source=job["source"], url=url)
-                        temp_path, filename = await asyncio.to_thread(
-                            download_url,
-                            url,
-                            self.config.temp_root,
-                            self.active_cancel,
-                            self.config.max_retries,
-                        )
-                    else:
-                        await self.update_status(status_message, "⬇️ جاري الحصول على الملف من Telegram…")
-                        temp_path, filename = await self.download_telegram_media(application, job)
-
-                self.state.update_job(job_id, temp_path=temp_path, filename=filename)
-
-            self.ensure_not_cancelled()
-            await self.update_status(status_message, "☁️ جاري حفظ الملف في Google Drive…")
-            result = await asyncio.to_thread(
-                finalize_to_drive,
-                temp_path,
-                filename,
-                self.config.drive_destination,
-                self.state,
-                job.get("source", "telegram"),
-                job_id,
-            )
-            temp_path = None
-            if result["status"] == "duplicate":
-                await self.update_status(status_message, "ℹ️ الملف موجود مسبقًا")
-            else:
-                await self.update_status(
-                    status_message,
-                    f"✅ تم الحفظ بنجاح\n📄 {result['filename']}\n📦 {result['size']:,} بايت",
-                )
-        except Exception:
-            if temp_path:
-                self.state.update_job(job_id, temp_path=temp_path)
-            raise
-
-    async def download_telegram_media(self, application: Application, job: dict):
-        self.ensure_not_cancelled()
-        file_id = job["telegram_file_id"]
-        tg_file = await application.bot.get_file(file_id)
-        file_path = tg_file.file_path
-        if not file_path:
-            raise TransferError("لم يُرجع Telegram مسار الملف.")
-        url = f"https://api.telegram.org/file/bot{self.config.telegram_token}/{file_path}"
-        filename = safe_filename(job.get("filename") or f"telegram_{job['message_id']}")
-        path, _ = await asyncio.to_thread(
-            download_url,
-            url,
-            self.config.temp_root,
-            self.active_cancel,
-            self.config.max_retries,
-        )
-        final_path = os.path.join(self.config.temp_root, f"{job['id']}_{filename}")
-        os.replace(path, final_path)
-        if not os.path.isfile(final_path) or os.path.getsize(final_path) == 0:
-            raise TransferError("تعذر الحصول على الملف من Telegram.")
-        return final_path, filename
-
-    async def request_file_url(self, application: Application, job: dict) -> str:
-        if not self.file2url_username:
-            raise TransferError("مسار الملفات الكبيرة غير مهيأ.")
+    async def register_waiter(self, job_id: str) -> asyncio.Future[str]:
         loop = asyncio.get_running_loop()
-        self.file2url_waiter = loop.create_future()
-        try:
-            await application.bot.forward_message(
-                chat_id=self.file2url_username,
-                from_chat_id=job["chat_id"],
-                message_id=job["message_id"],
-            )
-            while True:
-                if self.active_cancel and self.active_cancel.is_set():
-                    raise TransferCancelled("تم إلغاء العملية.")
-                try:
-                    return await asyncio.wait_for(asyncio.shield(self.file2url_waiter), timeout=1)
-                except asyncio.TimeoutError:
-                    continue
-        finally:
-            if self.file2url_waiter and not self.file2url_waiter.done():
-                self.file2url_waiter.cancel()
-            self.file2url_waiter = None
+        future: asyncio.Future[str] = loop.create_future()
+        async with self._lock:
+            self._waiters[job_id] = future
+        return future
 
-    def ensure_not_cancelled(self):
-        if self.active_cancel and self.active_cancel.is_set():
-            raise TransferCancelled("تم إلغاء العملية.")
+    async def complete_waiter(self, url: str) -> bool:
+        async with self._lock:
+            # Complete the earliest active waiter FIFO
+            for job_id, fut in list(self._waiters.items()):
+                if not fut.done():
+                    fut.set_result(url)
+                    del self._waiters[job_id]
+                    return True
+        return False
 
-    def restore_unfinished(self):
-        for job in self.state.unfinished_jobs():
-            previous_status = job.get("status")
-            self.state.update_job(
-                job["id"],
-                status="queued",
-                recovery_at=now(),
-                recovery_from_status=previous_status,
-            )
-            self.queue.put_nowait(job)
+    async def cancel_waiter(self, job_id: str) -> None:
+        async with self._lock:
+            fut = self._waiters.pop(job_id, None)
+            if fut and not fut.done():
+                fut.cancel()
 
-    @staticmethod
-    def extract_url(message):
-        text = message.text or message.caption or ""
-        match = URL_RE.search(text)
-        return match.group(0).rstrip(".,);]") if match else None
 
-    @staticmethod
-    def extract_media(message):
-        if message.document:
-            return message.document.file_id, message.document.file_name or "document", message.document.file_size
-        if message.video:
-            return message.video.file_id, message.video.file_name or "video.mp4", message.video.file_size
-        if message.audio:
-            return message.audio.file_id, message.audio.file_name or "audio", message.audio.file_size
-        if message.voice:
-            return message.voice.file_id, "voice.ogg", message.voice.file_size
-        if message.photo:
-            item = message.photo[-1]
-            return item.file_id, "photo.jpg", item.file_size
-        return None
+class TelegramDriveBotApp:
+    def __init__(self, config: Config):
+        self.config = config
+        self.state = StateStore(config.STATE_PATH)
+        self.file2url = File2URLProvider(config.FILE2URL_BOT_USERNAME, timeout=config.FILE2URL_TIMEOUT)
+        self.queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+        self.active_jobs: Dict[str, Dict[str, Any]] = {}
+        self.cancel_events: Dict[str, threading.Event] = {}
+        self.worker_task: Optional[asyncio.Task[None]] = None
+        self.application: Optional[Application] = None
 
-    @staticmethod
-    async def update_status(message, text):
-        try:
-            await message.edit_text(text)
-        except Exception:
-            pass
+    # Authorization
+    def is_authorized(self, update: Update) -> bool:
+        user = update.effective_user
+        if not user:
+            return False
+        return int(user.id) == int(self.config.OWNER_ID)
 
-    def build_application(self):
-        application = (
-            Application.builder()
-            .token(self.config.telegram_token)
-            .post_init(self.post_init)
-            .build()
+    async def check_auth_or_reject(self, update: Update) -> bool:
+        if not self.is_authorized(update):
+            if update.effective_message:
+                await update.effective_message.reply_text("⛔ عذراً، هذا البوت خاص وغير مصرح لك باستخدامه.")
+            return False
+        return True
+
+    # Telegram Handlers
+    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_auth_or_reject(update):
+            return
+        msg = (
+            "👋 مرحباً بك في TelegramDriveBot\n\n"
+            "الأوامر المدعومة:\n"
+            "/status - عرض حالة النظام والمهام الجارية\n"
+            "/retry <job_id> - إعادة تشغيل مهمة فاشلة\n"
+            "/cancel <job_id> - إلغاء مهمة جارية\n"
+            "/help - مساعدة\n\n"
+            "أرسل أي ملف، مستند، فيديو، أو رابط مباشر وسأقوم بحفظه في Google Drive بأمان."
         )
-        application.add_handler(MessageHandler(filters.ALL, self.bot_message), group=-2)
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.enqueue))
-        application.add_handler(MessageHandler(filters.ATTACHMENT, self.enqueue))
-        application.add_handler(CallbackQueryHandler(self.callback))
-        application.add_handler(MessageHandler(filters.COMMAND & filters.Regex(r"^/start$"), self.start))
-        application.add_handler(MessageHandler(filters.COMMAND & filters.Regex(r"^/cancel$"), self.cancel))
-        return application
+        await update.effective_message.reply_text(msg)
 
-    async def post_init(self, application: Application):
-        self.restore_unfinished()
-        application.create_task(self.worker(application))
+    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_auth_or_reject(update):
+            return
+        await self.cmd_start(update, context)
+
+    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_auth_or_reject(update):
+            return
+        jobs = self.state.all_jobs()
+        active = [j for j in jobs if j.get("status") in {"queued", "downloading", "downloaded", "verifying"}]
+        stats = self.state.data.get("stats", {})
+
+        report = (
+            f"📊 حالة النظام:\n"
+            f"• المهام النشطة: {len(active)}\n"
+            f"• المكتملة: {stats.get('completed', 0)}\n"
+            f"• الفاشلة: {stats.get('failed', 0)}\n"
+            f"• الملغاة: {stats.get('cancelled', 0)}\n\n"
+        )
+        if active:
+            report += "المهام الجارية حالياً:\n"
+            for j in active[:5]:
+                report += f"- [{j.get('id')}] {j.get('filename')} ({j.get('status')})\n"
+        else:
+            report += "لا توجد مهام نشطة حالياً."
+
+        await update.effective_message.reply_text(report)
+
+    async def cmd_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_auth_or_reject(update):
+            return
+        args = context.args or []
+        if not args:
+            await update.effective_message.reply_text("يرجى تحديد معرّف المهمة: /cancel <job_id>")
+            return
+        job_id = args[0].strip()
+        job = self.state.get_job(job_id)
+        if not job:
+            await update.effective_message.reply_text(f"لم يتم العثور على المهمة {job_id}")
+            return
+
+        if job.get("status") in {"completed", "failed", "cancelled"}:
+            await update.effective_message.reply_text(f"المهمة في حالة نهائية بالفعل ({job.get('status')}).")
+            return
+
+        # Trigger cancellation event
+        event = self.cancel_events.get(job_id)
+        if event:
+            event.set()
+        await self.file2url.cancel_waiter(job_id)
+        self.state.update_job(job_id, status="cancelled", error="تم الإلغاء بواسطة المستخدم")
+        await update.effective_message.reply_text(f"✅ تم إرسال أمر الإلغاء للمهمة {job_id}")
+
+    async def cmd_retry(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_auth_or_reject(update):
+            return
+        args = context.args or []
+        if not args:
+            await update.effective_message.reply_text("يرجى تحديد معرّف المهمة: /retry <job_id>")
+            return
+        job_id = args[0].strip()
+        job = self.state.get_job(job_id)
+        if not job:
+            await update.effective_message.reply_text(f"المهمة {job_id} غير موجودة.")
+            return
+
+        if job.get("status") not in {"failed", "cancelled"}:
+            await update.effective_message.reply_text(f"المهمة في حالة ({job.get('status')}) ولا يمكن إعادة تشغيلها.")
+            return
+
+        self.state.update_job(job_id, status="queued", retries=0, error=None)
+        await self.queue.put(self.state.get_job(job_id))
+        await update.effective_message.reply_text(f"🔄 تمت إعادة جدولة المهمة {job_id} في صف الانتظار.")
+
+    # Media and Link Handling
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_message:
+            return
+
+        # File2URL response detection: if received from external bot
+        sender_username = (update.effective_user.username or "") if update.effective_user else ""
+        if sender_username.lower() == self.file2url.bot_username.lower():
+            text = update.effective_message.text or ""
+            match = URL_REGEX.search(text)
+            if match:
+                completed = await self.file2url.complete_waiter(match.group(0))
+                if completed:
+                    return
+
+        if not await self.check_auth_or_reject(update):
+            return
+
+        message = update.effective_message
+        text = message.text or message.caption or ""
+
+        # Direct URL check
+        url_match = URL_REGEX.search(text)
+        if url_match:
+            url = url_match.group(0)
+            job_id = str(uuid.uuid4())[:8]
+            fname = extract_filename_from_url(url, f"file_{job_id}.bin")
+            job = self.state.add_job(
+                job_id=job_id,
+                source_type="direct_url",
+                filename=fname,
+                chat_id=message.chat_id,
+                user_id=message.from_user.id,
+                source_url=url,
+            )
+            await self.queue.put(job)
+            await message.reply_text(f"📥 تم استلام الرابط وإضافته لصف الانتظار:\n• المعرّف: `{job_id}`\n• الملف: `{fname}`", parse_mode="Markdown")
+            return
+
+        # Document or Video attachment
+        media = message.document or message.video or message.audio
+        if media:
+            job_id = str(uuid.uuid4())[:8]
+            file_name = getattr(media, "file_name", None) or f"media_{job_id}.bin"
+            file_name = safe_filename(file_name)
+            file_size = getattr(media, "file_size", 0)
+
+            # Check Telegram 20MB limit
+            source_type = "telegram_media" if file_size <= 20 * 1024 * 1024 else "telegram_large"
+            job = self.state.add_job(
+                job_id=job_id,
+                source_type=source_type,
+                filename=file_name,
+                chat_id=message.chat_id,
+                user_id=message.from_user.id,
+                telegram_file_id=media.file_id,
+            )
+            await self.queue.put(job)
+            await message.reply_text(f"📦 تم استلام الملف:\n• المعرّف: `{job_id}`\n• الاسم: `{file_name}`\n• الحجم: {round(file_size / (1024*1024), 2)} MB", parse_mode="Markdown")
+            return
+
+    # Worker Loop
+    async def worker_loop(self) -> None:
+        logger.info("Worker loop started.")
+        while True:
+            try:
+                job = await self.queue.get()
+                job_id = job["id"]
+                self.active_jobs[job_id] = job
+                cancel_event = threading.Event()
+                self.cancel_events[job_id] = cancel_event
+
+                try:
+                    await self.process_job(job, cancel_event)
+                except Exception as exc:
+                    logger.exception("Error processing job %s: %s", job_id, exc)
+                finally:
+                    self.active_jobs.pop(job_id, None)
+                    self.cancel_events.pop(job_id, None)
+                    self.queue.task_done()
+            except asyncio.CancelledError:
+                logger.info("Worker loop cancelled.")
+                break
+            except Exception as exc:
+                logger.exception("Unexpected error in worker loop: %s", exc)
+
+    async def process_job(self, job: Dict[str, Any], cancel_event: threading.Event) -> None:
+        job_id = job["id"]
+        chat_id = job["chat_id"]
+        source_type = job["source_type"]
+        temp_dir = self.config.LOCAL_STAGING_DIR
+        dest_dir = self.config.DRIVE_DESTINATION
+
+        if cancel_event.is_set():
+            self.state.update_job(job_id, status="cancelled")
+            return
+
+        self.state.update_job(job_id, status="downloading")
+        temp_file_path: Optional[str] = None
+
+        try:
+            # 1. Obtain URL
+            download_link: Optional[str] = None
+
+            if source_type == "direct_url":
+                download_link = job.get("source_url")
+            elif source_type == "telegram_media":
+                tg_file = await self.application.bot.get_file(job["telegram_file_id"])
+                download_link = tg_file.file_path
+            elif source_type == "telegram_large":
+                # Forward to File2URL if configured
+                waiter = await self.file2url.register_waiter(job_id)
+                try:
+                    # Forward message logic
+                    await self.application.bot.forward_message(
+                        chat_id=f"@{self.file2url.bot_username}",
+                        from_chat_id=chat_id,
+                        message_id=job.get("telegram_message_id", 0),
+                    )
+                    download_link = await asyncio.wait_for(waiter, timeout=self.file2url.timeout)
+                except asyncio.TimeoutError:
+                    raise NonRetryableTransferError("انتهت مهلة انتظار الرابط من بوت File2URL.")
+                except Exception as exc:
+                    raise NonRetryableTransferError(f"فشل التحويل عبر File2URL: {exc}")
+
+            if not download_link:
+                raise NonRetryableTransferError("تعذر تحديد رابط التحميل للمهمة.")
+
+            # 2. Download to local staging in separate thread
+            loop = asyncio.get_running_loop()
+            temp_file_path, resolved_name, size = await loop.run_in_executor(
+                None,
+                download_url,
+                download_link,
+                temp_dir,
+                job.get("filename"),
+                cancel_event,
+                self.config.MAX_RETRIES,
+            )
+
+            self.state.update_job(job_id, status="downloaded", temp_path=temp_file_path, filename=resolved_name, size=size)
+
+            # 3. Finalize to Drive
+            result = await loop.run_in_executor(
+                None,
+                finalize_to_drive,
+                temp_file_path,
+                resolved_name,
+                dest_dir,
+                self.state,
+                job_id,
+                cancel_event,
+            )
+
+            # 4. Notify owner
+            dup_msg = " (تم تخطي النسخ لوجود ملف مطابق تماماً)" if result.is_duplicate else ""
+            collision_msg = " (تمت إعادة التسمية لمنع الاستبدال)" if result.action == "collision_renamed" else ""
+            msg = (
+                f"✅ اكتمل حفظ الملف بنجاح!{dup_msg}{collision_msg}\n"
+                f"• الملف: `{os.path.basename(result.destination_path)}`\n"
+                f"• الحجم: {round(result.size / (1024*1024), 2)} MB\n"
+                f"• المعرّف: `{job_id}`"
+            )
+            await self.application.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+
+        except NonRetryableTransferError as exc:
+            self.state.update_job(job_id, status="failed", error=str(exc))
+            await self.application.bot.send_message(chat_id=chat_id, text=f"❌ فشلت المهمة {job_id}: {exc}")
+        except Exception as exc:
+            self.state.update_job(job_id, status="failed", error=str(exc))
+            await self.application.bot.send_message(chat_id=chat_id, text=f"❌ خطأ غير متوقع في المهمة {job_id}: {exc}")
+        finally:
+            # Assure staging cleanup
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except OSError:
+                    pass
+
+    # Recovery
+    def restore_unfinished(self) -> None:
+        """Deterministically restore incomplete jobs on startup."""
+        unfinished = self.state.unfinished_jobs()
+        logger.info("Restoring %d unfinished jobs from state.", len(unfinished))
+        for job in unfinished:
+            status = job.get("status")
+            job_id = job["id"]
+
+            # If staged temp file is gone (new Colab session), we must re-queue from source
+            temp_path = job.get("temp_path")
+            if status in {"downloaded", "verifying"} and (not temp_path or not os.path.exists(temp_path)):
+                logger.info("Job %s temp staging file lost after restart; resetting to queued.", job_id)
+                self.state.update_job(job_id, status="queued", recovery_from_status=status, temp_path=None)
+            else:
+                self.state.update_job(job_id, status="queued", recovery_from_status=status)
+
+            self.queue.put_nowait(self.state.get_job(job_id))
+
+    def build_application(self) -> Application:
+        self.application = ApplicationBuilder().token(self.config.TELEGRAM_BOT_TOKEN).build()
+        self.application.add_handler(CommandHandler("start", self.cmd_start))
+        self.application.add_handler(CommandHandler("help", self.cmd_help))
+        self.application.add_handler(CommandHandler("status", self.cmd_status))
+        self.application.add_handler(CommandHandler("cancel", self.cmd_cancel))
+        self.application.add_handler(CommandHandler("retry", self.cmd_retry))
+        self.application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.handle_message))
+        return self.application

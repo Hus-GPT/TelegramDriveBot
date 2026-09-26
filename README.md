@@ -1,30 +1,50 @@
 # TelegramDriveBot
 
-Private, single-owner Telegram bot for moving files and URLs into one Google Drive destination from Google Colab.
+A lightweight, reliable Telegram bot designed to safely stream direct downloads and media files directly into Google Drive from within a Google Colab session.
 
-## Current v1 architecture
+## Core Capabilities (Milestone 1)
 
-`Telegram / URL → temporary Colab → mounted Google Drive → verification → cleanup`
+* **Direct URL Streaming:** Streams downloads directly into local Colab staging in incremental chunks without loading entire files into RAM.
+* **Telegram Media Acquisition:** Handles Telegram native documents, audio, and video up to 20MB directly via Bot API, and forwards larger media through File2URL.
+* **Integrity Verification:** End-to-end SHA-256 and byte-size verification before and after finalization to Google Drive.
+* **Atomic State & Recovery:** Deterministic JSON state with atomic file replacements (`os.replace`) preserving transfer tracking across Colab restarts.
+* **Duplicate & Collision Safety:** Identical SHA-256 matches are recognized as duplicates; same-name differing-content files receive automated collision suffixes (`file (1).ext`) preventing data loss.
+* **Clean Cleanup:** Guarantees removal of temporary staging chunks upon completion, failure, or cancellation.
 
-Google Drive API is intentionally not used in v1.
+## Architecture
 
-## Implemented foundation
+```text
+Telegram Message (Owner Only)
+    │
+    ▼
+URL / Media Identification
+    │
+    ▼
+Job Creation (StateStore: queued)
+    │
+    ▼
+Single-Worker Async Queue
+    │
+    ▼
+Streamed Download to Local Staging (/tmp/...)
+    │
+    ▼
+Source SHA-256 + Size Computation (StateStore: downloaded)
+    │
+    ▼
+Google Drive Verification & Copy (.part_<job_id> landing)
+    │
+    ▼
+Destination SHA-256 + Size Match (StateStore: completed)
+    │
+    ▼
+Staging File Cleanup
+```
 
-- Owner-only Telegram access.
-- Direct URL intake.
-- Telegram document/video/audio/voice/photo intake.
-- Queue with one active transfer at a time.
-- Persistent state on mounted Google Drive.
-- Startup recovery of unfinished jobs.
-- Temporary-file cleanup after verified storage.
-- SHA-256 duplicate detection after obtaining the file.
-- Bounded URL download behavior and basic invalid-HTML detection.
-- Cancel button for the active operation.
-- Large Telegram-file bridge path through `@File2url_rbot`, using Telegram bot-to-bot communication when configured and enabled.
-- Secure configuration through Colab Secrets/environment variables; secrets are not stored in GitHub.
+## Running Tests
 
-## Important
+Automated tests run locally without requiring Telegram tokens or real Google Drive mounts:
 
-GitHub is the source of truth for the project, not the execution environment. Actual Telegram/Colab/Drive operation must be verified in Google Colab.
-
-See `PROJECT_SPEC.md` for the full specification and `COLAB_SETUP.md` for the current setup path.
+```bash
+pytest tests/
+```
