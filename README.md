@@ -49,4 +49,4 @@ Automated tests run locally without requiring Telegram tokens or real Google Dri
 pytest -q
 ```
 
-Actual test suite inventory: 13 top-level test functions in `tests/test_core.py`.
+Actual test suite inventory: exactly 14 top-level test functions in `tests/test_core.py`.

@@ -41,4 +41,12 @@ In the left sidebar of Google Colab, open **Secrets** (key icon) and set:
 * **File2URL Forwarding:**
   * Telegram restricts Bot API downloads to 20MB. Media over 20MB is forwarded to `@File2url_rbot`.
   * The single-worker engine waits up to 120s for the external response. If the external bot fails or times out, the job fails cleanly without stalling subsequent transfers.
-  * Invariant: exactly one File2URL exchange is active at any time; unsolicited or late messages are safely discarded.
+  * Invariant: exactly one File2URL exchange is active at any time; unsolicited or late messages are safely discarded. Note that `@File2url_rbot` does not echo private job tokens; correlation is achieved strictly via serialized single-worker execution.
+* **Google Drive FUSE Filesystem Caveats:**
+  * Google Drive mounted via `google.colab.drive.mount` utilizes a userspace FUSE filesystem layer over Google Drive APIs.
+  * While `os.replace` operates atomically on local POSIX filesystems, FUSE remote mounts may implement file renaming via multi-step API calls.
+  * To guarantee safety across network drops or Colab kernel deaths on FUSE mounts, the engine employs a defense-in-depth model:
+    1. Writes to a hidden job-tagged file (`.part_<job_id>_*`).
+    2. Recalculates full SHA-256 and byte-size on the destination `.part` file.
+    3. Promotes the `.part` file to the final destination path via `os.replace`.
+    4. On restart, startup recovery cleans orphan `.part_<job_id>_*` files and executes duplicate content matching (SHA-256 + size) against the final destination. If an interrupted transfer completed its destination write before state was saved, duplicate recovery marks the job completed without re-copying or creating duplicate collision files.

@@ -243,6 +243,66 @@ def test_finalize_filename_collision(temp_dirs):
     assert os.path.exists(res.destination_path)
 
 
+def test_finalize_multiple_collisions(temp_dirs):
+    staging, drive = temp_dirs
+
+    # Create file.txt, file (1).txt, file (2).txt
+    for name, content in [("data.txt", b"v0"), ("data (1).txt", b"v1"), ("data (2).txt", b"v2")]:
+        with open(os.path.join(drive, name), "wb") as f:
+            f.write(content)
+
+    src = os.path.join(staging, "data.txt")
+    with open(src, "wb") as f:
+        f.write(b"new v3")
+
+    store = StateStore(os.path.join(drive, "state.json"))
+    store.add_job("j_col3", "direct_url", "data.txt", 1, 2)
+    store.update_job("j_col3", status="downloading")
+    store.update_job("j_col3", status="downloaded")
+
+    res = finalize_to_drive(src, "data.txt", drive, store, "j_col3")
+
+    assert res.action == "collision_renamed"
+    assert res.destination_path == os.path.join(drive, "data (3).txt")
+    assert os.path.exists(res.destination_path)
+    assert not os.path.exists(src)
+
+
+def test_duplicate_recovery_when_target_already_completed_on_drive(temp_dirs):
+    """Crash scenario: Colab died after os.replace moved file to target, but before state was updated."""
+    staging, drive = temp_dirs
+
+    content = b"Content transferred successfully before crash"
+    sha, size = hashlib.sha256(content).hexdigest(), len(content)
+
+    # Final target file already completed on Drive
+    target_path = os.path.join(drive, "crash_target.bin")
+    with open(target_path, "wb") as f:
+        f.write(content)
+
+    # Local staging file still present
+    local_staging = os.path.join(staging, "crash_staging.bin")
+    with open(local_staging, "wb") as f:
+        f.write(content)
+
+    store = StateStore(os.path.join(drive, "state.json"))
+    # Job remained in 'downloaded' or 'verifying' because state update was interrupted
+    store.add_job("j_crash", "direct_url", "crash_target.bin", 1, 2)
+    store.update_job("j_crash", status="downloading")
+    store.update_job("j_crash", status="downloaded", temp_path=local_staging, sha256=sha, size=size)
+
+    # Run finalization (as worker/recovery would do)
+    res = finalize_to_drive(local_staging, "crash_target.bin", drive, store, "j_crash")
+
+    # Confirms duplicate was recognized: skipped re-copying, no duplicate collision file created
+    assert res.is_duplicate is True
+    assert res.action == "duplicate_skipped"
+    assert res.destination_path == target_path
+    assert not os.path.exists(os.path.join(drive, "crash_target (1).bin"))
+    assert store.get_job("j_crash")["status"] == "completed"
+    assert not os.path.exists(local_staging)
+
+
 # ---------------------------------------------------------
 # 5. Safe Orphan Drive Partial Cleanup
 # ---------------------------------------------------------
@@ -400,6 +460,46 @@ def test_restore_unfinished_branches(temp_dirs):
     assert app.state.get_job("j_ver")["status"] == "downloaded"
 
 
+def test_recovery_idempotency(temp_dirs):
+    staging, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=123456,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+
+    valid_stage = os.path.join(staging, "idem.bin")
+    with open(valid_stage, "wb") as f:
+        f.write(b"stable content")
+    v_sha, v_size = hash_file(valid_stage)
+
+    app.state.add_job("j_idem", "direct_url", "idem.bin", 1, 2)
+    app.state.update_job("j_idem", status="downloading")
+    app.state.update_job("j_idem", status="downloaded", temp_path=valid_stage, sha256=v_sha, size=v_size)
+
+    # First recovery
+    app.restore_unfinished()
+    state_after_1 = json.dumps(app.state.data, sort_keys=True)
+    q_size_1 = app.queue.qsize()
+
+    # Empty queue to simulate clean queue before re-run
+    while not app.queue.empty():
+        app.queue.get_nowait()
+
+    # Second recovery
+    app.restore_unfinished()
+    state_after_2 = json.dumps(app.state.data, sort_keys=True)
+    q_size_2 = app.queue.qsize()
+
+    # Must produce identical structural state
+    assert q_size_1 == q_size_2 == 1
+    assert app.state.get_job("j_idem")["status"] == "downloaded"
+    assert len(app.state.all_jobs()) == 1
+
+
 # ---------------------------------------------------------
 # 9. Telegram Message ID Persistence
 # ---------------------------------------------------------
@@ -476,79 +576,7 @@ def test_download_error_classification(temp_dirs):
 
 
 # ---------------------------------------------------------
-# 11. Multi-Collision Finalization Test
-# ---------------------------------------------------------
-
-def test_finalize_multiple_collisions(temp_dirs):
-    staging, drive = temp_dirs
-
-    # Create file.txt, file (1).txt, file (2).txt
-    for name, content in [("data.txt", b"v0"), ("data (1).txt", b"v1"), ("data (2).txt", b"v2")]:
-        with open(os.path.join(drive, name), "wb") as f:
-            f.write(content)
-
-    src = os.path.join(staging, "data.txt")
-    with open(src, "wb") as f:
-        f.write(b"new v3")
-
-    store = StateStore(os.path.join(drive, "state.json"))
-    store.add_job("j_col3", "direct_url", "data.txt", 1, 2)
-    store.update_job("j_col3", status="downloading")
-    store.update_job("j_col3", status="downloaded")
-
-    res = finalize_to_drive(src, "data.txt", drive, store, "j_col3")
-
-    assert res.action == "collision_renamed"
-    assert res.destination_path == os.path.join(drive, "data (3).txt")
-    assert os.path.exists(res.destination_path)
-    assert not os.path.exists(src)
-
-
-# ---------------------------------------------------------
-# 12. Recovery Idempotency Test
-# ---------------------------------------------------------
-
-def test_recovery_idempotency(temp_dirs):
-    staging, drive = temp_dirs
-    cfg = Config(
-        TELEGRAM_BOT_TOKEN="mock_token",
-        OWNER_ID=123456,
-        DRIVE_DESTINATION=drive,
-        LOCAL_STAGING_DIR=staging,
-        STATE_PATH=os.path.join(drive, "state.json"),
-    )
-    app = TelegramDriveBotApp(cfg)
-
-    valid_stage = os.path.join(staging, "idem.bin")
-    with open(valid_stage, "wb") as f:
-        f.write(b"stable content")
-    v_sha, v_size = hash_file(valid_stage)
-
-    app.state.add_job("j_idem", "direct_url", "idem.bin", 1, 2)
-    app.state.update_job("j_idem", status="downloading")
-    app.state.update_job("j_idem", status="downloaded", temp_path=valid_stage, sha256=v_sha, size=v_size)
-
-    # First recovery
-    app.restore_unfinished()
-    state_after_1 = json.dumps(app.state.data, sort_keys=True)
-    q_size_1 = app.queue.qsize()
-
-    # Empty queue to simulate clean queue before re-run
-    while not app.queue.empty():
-        app.queue.get_nowait()
-
-    # Second recovery
-    app.restore_unfinished()
-    state_after_2 = json.dumps(app.state.data, sort_keys=True)
-    q_size_2 = app.queue.qsize()
-
-    # Must produce identical structural state
-    assert q_size_1 == q_size_2 == 1
-    assert app.state.get_job("j_idem")["status"] == "downloaded"
-
-
-# ---------------------------------------------------------
-# 13. Owner Authorization & Unauthorized Message Rejection
+# 11. Owner Authorization & Unauthorized Message Rejection
 # ---------------------------------------------------------
 
 def test_owner_authorization(temp_dirs):
