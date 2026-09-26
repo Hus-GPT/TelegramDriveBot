@@ -8,7 +8,7 @@ import os
 import re
 import threading
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from telegram import CallbackQuery, Update
 from telegram.ext import (
@@ -34,6 +34,7 @@ from app.transfer import (
     get_storage_diagnostics,
     hash_file,
     safe_filename,
+    sanitize_url_for_logging,
     validate_destination_directory,
     validate_url_security,
 )
@@ -198,7 +199,7 @@ class TelegramDriveBotApp:
         return report
 
     def render_job_detail_text(self, job: Dict[str, Any]) -> str:
-        """Construct detailed metadata view for a specific job."""
+        """Construct detailed metadata view for a specific job, sanitizing errors and paths."""
         job_id = job.get("id")
         st = job.get("status")
         fname = job.get("filename", "بدون اسم")
@@ -207,9 +208,15 @@ class TelegramDriveBotApp:
         started = (job.get("started_at") or "--")[:19].replace("T", " ")
         completed = (job.get("completed_at") or "--")[:19].replace("T", " ")
         sha = job.get("sha256") or "لم تُحسب بعد"
-        err = job.get("error")
+        raw_err = job.get("error")
         retries = job.get("retries", 0)
-        dest = job.get("destination_path") or "غير محدد بعد"
+
+        # Sanitize destination path (show only base folder and filename)
+        dest_raw = job.get("destination_path")
+        if dest_raw:
+            dest = f".../{os.path.basename(os.path.dirname(dest_raw))}/{os.path.basename(dest_raw)}"
+        else:
+            dest = "غير محدد بعد"
 
         detail = (
             f"📋 *تفاصيل المهمة:* `{job_id}`\n\n"
@@ -224,8 +231,9 @@ class TelegramDriveBotApp:
             f"• مسار الوجهة: `{dest}`\n"
             f"• البصمة (SHA-256): `{sha}`\n"
         )
-        if err:
-            detail += f"• الخطأ المسجل: `{err}`\n"
+        if raw_err:
+            sanitized_err = humanize_error(Exception(raw_err))
+            detail += f"• سبب التعثر: {sanitized_err}\n"
         return detail
 
     def render_storage_text(self) -> str:
@@ -334,6 +342,25 @@ class TelegramDriveBotApp:
         report = self.render_status_text()
         await update.effective_message.reply_text(report, parse_mode="Markdown")
 
+    async def cmd_status_deep_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle deep link commands formatted as /status_<job_id>."""
+        if not await self.check_auth_or_reject(update):
+            return
+        message = update.effective_message
+        text = (message.text or "").strip()
+        match = re.match(r"^/status_([A-Za-z0-9_-]+)$", text)
+        if match:
+            job_id = match.group(1)
+            job = self.state.get_job(job_id)
+            if not job:
+                await message.reply_text(f"❓ لم يتم العثور على مهمة بالمعرّف `{job_id}`.")
+                return
+            detail = self.render_job_detail_text(job)
+            kb = build_job_action_keyboard(job_id, job.get("status", ""))
+            await message.reply_text(detail, parse_mode="Markdown", reply_markup=kb)
+        else:
+            await self.cmd_status(update, context)
+
     async def cmd_storage(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self.check_auth_or_reject(update):
             return
@@ -429,7 +456,7 @@ class TelegramDriveBotApp:
         await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
     # ---------------------------------------------------------
-    # Callback Query Handler (Milestone 6)
+    # Callback Query Handler
     # ---------------------------------------------------------
 
     async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -480,13 +507,15 @@ class TelegramDriveBotApp:
                 await self.safe_edit_text(chat_id, msg_id, help_text, reply_markup=build_main_keyboard())
             return
 
-        # 2. Cancel Active Fast Action
+        # 2. Cancel Active Fast Action -> MUST REQUIRE CONFIRMATION
         if data == "act_cancel_active":
             if self.active_jobs:
                 act_id = next(iter(self.active_jobs.keys()))
-                _, cancel_msg = await self.execute_cancel_job(act_id)
-                if query.message:
-                    await query.message.reply_text(cancel_msg, parse_mode="Markdown")
+                job = self.state.get_job(act_id)
+                prompt = f"⚠️ هل أنت متأكد من إلغاء المهمة الجارية `{act_id}` (`{job.get('filename') if job else ''}`)؟"
+                kb = build_confirmation_keyboard("cancel", act_id)
+                if chat_id and msg_id:
+                    await self.safe_edit_text(chat_id, msg_id, prompt, reply_markup=kb)
             else:
                 if query.message:
                     await query.message.reply_text("ℹ️ لا توجد عملية نشطة حالياً لإلغائها.")
@@ -516,7 +545,7 @@ class TelegramDriveBotApp:
                 except Exception:
                     pass
                 return
-            prompt = f"⚠️ هل أنت متأكد من إلغاء المهمة `{job_id}` (`{job.get('filename')}`)؟"
+            prompt = f"⚠️ هل أنت متأكد من إلغاء المهمة `{job_id}` (`{job.get('filename')}`)?\n\nاضغط تأكيد للإلغاء أو تراجع للمحافظة على المهمة."
             kb = build_confirmation_keyboard("cancel", job_id)
             if chat_id and msg_id:
                 await self.safe_edit_text(chat_id, msg_id, prompt, reply_markup=kb)
@@ -540,6 +569,19 @@ class TelegramDriveBotApp:
         # 5. Executing Actions: do_cancel_<id>, do_retry_<id>
         if data.startswith("do_cancel_"):
             job_id = data.replace("do_cancel_", "")
+            # Re-verify latest state before executing (prevents canceling already-completed jobs)
+            job_now = self.state.get_job(job_id)
+            if not job_now or job_now.get("status") in {"completed", "failed", "cancelled"}:
+                try:
+                    await query.answer("⚠️ تعذر الإلغاء: حالة المهمة تغيرت بالفعل في النظام.", show_alert=True)
+                except Exception:
+                    pass
+                if chat_id and msg_id and job_now:
+                    detail = self.render_job_detail_text(job_now)
+                    kb = build_job_action_keyboard(job_id, job_now.get("status", ""))
+                    await self.safe_edit_text(chat_id, msg_id, detail, reply_markup=kb)
+                return
+
             _, cancel_msg = await self.execute_cancel_job(job_id)
             job = self.state.get_job(job_id)
             kb = build_job_action_keyboard(job_id, job.get("status", "")) if job else None
@@ -549,6 +591,18 @@ class TelegramDriveBotApp:
 
         if data.startswith("do_retry_"):
             job_id = data.replace("do_retry_", "")
+            job_now = self.state.get_job(job_id)
+            if not job_now or job_now.get("status") not in {"failed", "cancelled"}:
+                try:
+                    await query.answer("⚠️ تعذر إعادة الجدولة: المهمة لم تعد قابلة للمحاولة.", show_alert=True)
+                except Exception:
+                    pass
+                if chat_id and msg_id and job_now:
+                    detail = self.render_job_detail_text(job_now)
+                    kb = build_job_action_keyboard(job_id, job_now.get("status", ""))
+                    await self.safe_edit_text(chat_id, msg_id, detail, reply_markup=kb)
+                return
+
             _, retry_msg = await self.execute_retry_job(job_id)
             job = self.state.get_job(job_id)
             kb = build_job_action_keyboard(job_id, job.get("status", "")) if job else None
@@ -578,16 +632,6 @@ class TelegramDriveBotApp:
 
         message = update.effective_message
         text = (message.text or message.caption or "").strip()
-
-        # Check for shorthand deep-link status command: /status_jobid
-        if text.startswith("/status_"):
-            job_id = text.replace("/status_", "").strip()
-            job = self.state.get_job(job_id)
-            if job:
-                detail = self.render_job_detail_text(job)
-                kb = build_job_action_keyboard(job_id, job.get("status", ""))
-                await message.reply_text(detail, parse_mode="Markdown", reply_markup=kb)
-                return
 
         # Direct URL check
         url_match = URL_REGEX.search(text)
@@ -622,7 +666,8 @@ class TelegramDriveBotApp:
             )
             job["ui_message_id"] = ack_msg.message_id
             await self.safe_enqueue_job(job)
-            logger.info("[job=%s] Accepted direct URL job into queue: %s", job_id, fname)
+            sanitized_log_url = sanitize_url_for_logging(url)
+            logger.info("[job=%s] Accepted direct URL job into queue: %s (source: %s)", job_id, fname, sanitized_log_url)
             return
 
         # Media Attachment
@@ -815,6 +860,8 @@ class TelegramDriveBotApp:
                         timeout=timeout_tuple,
                         max_download_size=self.config.MAX_DOWNLOAD_SIZE,
                         max_redirects=self.config.MAX_REDIRECTS,
+                        retry_base_delay=self.config.RETRY_INITIAL_DELAY,
+                        retry_max_delay=self.config.RETRY_MAX_DELAY,
                     ),
                 )
 
@@ -1001,6 +1048,8 @@ class TelegramDriveBotApp:
         self.application.add_handler(CommandHandler("history", self.cmd_history))
         self.application.add_handler(CommandHandler("cancel", self.cmd_cancel))
         self.application.add_handler(CommandHandler("retry", self.cmd_retry))
+        # Support deep-link commands formatted as /status_<job_id>
+        self.application.add_handler(MessageHandler(filters.Regex(r"^/status_[A-Za-z0-9_-]+$"), self.cmd_status_deep_link))
         self.application.add_handler(CallbackQueryHandler(self.handle_callback_query))
         self.application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.handle_message))
         return self.application

@@ -34,6 +34,8 @@ class Config:
     MAX_REDIRECTS: int = 10         # Maximum HTTP redirects allowed
     CONNECT_TIMEOUT: int = 15       # Connection timeout in seconds
     READ_TIMEOUT: int = 60          # Socket read timeout in seconds
+    RETRY_INITIAL_DELAY: float = 1.0  # Initial retry delay in seconds
+    RETRY_MAX_DELAY: float = 30.0     # Maximum retry backoff delay in seconds
 
     @classmethod
     def from_env(cls) -> Config:
@@ -64,4 +66,6 @@ class Config:
             MAX_REDIRECTS=int(_get_val("MAX_REDIRECTS", "10")),
             CONNECT_TIMEOUT=int(_get_val("CONNECT_TIMEOUT", "15")),
             READ_TIMEOUT=int(_get_val("READ_TIMEOUT", "60")),
+            RETRY_INITIAL_DELAY=float(_get_val("RETRY_INITIAL_DELAY", "1.0")),
+            RETRY_MAX_DELAY=float(_get_val("RETRY_MAX_DELAY", "30.0")),
         )

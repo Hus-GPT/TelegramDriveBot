@@ -2,20 +2,38 @@
 
 This guide describes how to run TelegramDriveBot inside a Google Colab notebook session.
 
-## One-Cell Startup
+## One-Cell Startup (With Safe Auto-Update)
 
 Paste and run the following in a single Colab cell:
 
 ```python
 import os
+import subprocess
 from google.colab import drive
 
 # 1. Mount Google Drive
 drive.mount('/content/drive')
 
-# 2. Clone repository if not present
-if not os.path.exists('/content/TelegramDriveBot'):
-    !git clone https://github.com/Hus-GPT/TelegramDriveBot.git /content/TelegramDriveBot
+# 2. Clone repository or perform safe fast-forward update
+repo_dir = '/content/TelegramDriveBot'
+repo_url = 'https://github.com/Hus-GPT/TelegramDriveBot.git'
+
+if not os.path.exists(repo_dir):
+    print("Cloning repository...")
+    subprocess.run(['git', 'clone', repo_url, repo_dir], check=True)
+else:
+    print("Updating existing repository (fast-forward only)...")
+    try:
+        subprocess.run(['git', '-C', repo_dir, 'fetch', 'origin'], check=True)
+        # Verify no uncommitted local changes before fast-forwarding
+        status = subprocess.run(['git', '-C', repo_dir, 'status', '--porcelain'], capture_output=True, text=True, check=True)
+        if not status.stdout.strip():
+            subprocess.run(['git', '-C', repo_dir, 'merge', '--ff-only', 'origin/main'], check=True)
+            print("Successfully updated to latest origin/main.")
+        else:
+            print("Notice: Local modifications detected in /content/TelegramDriveBot; skipping auto-merge to protect edits.")
+    except Exception as exc:
+        print(f"Warning: Could not auto-update repository: {exc}")
 
 %cd /content/TelegramDriveBot
 !pip install -r requirements.txt
@@ -35,7 +53,7 @@ In the left sidebar of Google Colab, open **Secrets** (key icon) and set:
 
 * `/start` : Mobile dashboard with Quick Inline Controls (Status, History, Storage, Cancel, Help).
 * `/status` : View real-time bot state, active job, queue count, and transfer metrics.
-* `/status <job_id>` : Inspect full lifecycle metadata, timestamps, hash, and interactive action buttons for a specific job.
+* `/status <job_id>` or `/status_<job_id>` : Inspect full lifecycle metadata, timestamps, hash, and interactive action buttons for a specific job.
 * `/storage` : View storage diagnostics (Google Drive destination writability, mount status, local staging disk capacity).
 * `/history` : Review recent completed, failed, and cancelled transfer history chronologically with `/status_<id>` links.
 * `/cancel` : Safely cancel the currently active transfer, or specify a job ID via `/cancel <job_id>`.
@@ -45,6 +63,7 @@ In the left sidebar of Google Colab, open **Secrets** (key icon) and set:
 ## Interactive Owner Control Surface (Milestone 6)
 
 * **Mobile Quick Controls:** The `/start` command provides a clean Inline Keyboard (`📊 الحالة`, `📜 السجل`, `💾 التخزين`, `❌ إلغاء الجارية`, `📖 المساعدة`).
+* **Active Cancel Confirmation:** Tapping `[❌ إلغاء الجارية]` displays a one-tap confirmation prompt (`نعم` / `تراجع`), preventing accidental cancellations.
 * **State-Aware Job Controls:** Dynamic inline buttons on job inspection and lifecycle messages:
   * `queued` / `downloading` $\to$ `[❌ تأكيد الإلغاء]`
   * `failed` / `cancelled` $\to$ `[🔁 إعادة المحاولة]`
@@ -53,15 +72,13 @@ In the left sidebar of Google Colab, open **Secrets** (key icon) and set:
 * **Stale Button Protection:** Callbacks validate live status in `StateStore` before executing. Tapping obsolete buttons (e.g. Cancel on a completed job) displays an alert without corrupting state.
 * **Complete Authorization Guard:** All callback queries, commands, and messages verify `update.effective_user.id == config.OWNER_ID` upfront.
 
-## Hardened Download Engine (Milestone 3)
+## Hardened Download Engine & Redirect SSRF Defense (Milestone 3 & Global Audit)
 
-* **Direct HTTP/HTTPS Streaming:** Transfers directly to local Colab staging in 1 MB chunks without buffering full files in RAM.
-* **Security & SSRF Mitigation:** Automatically rejects loopback (`127.0.0.1`, `localhost`), link-local, private subnets (`10.x`, `192.168.x`), and cloud metadata IP endpoints upfront.
-* **Redirects & Filename Precedence:** Safely follows HTTP redirects (up to 10) and determines target filenames with strict precedence (`custom_filename` $\to$ RFC 5987 / 6266 `Content-Disposition` $\to$ URL path $\to$ fallback) while sanitizing against path traversal and preserving Unicode/Arabic characters.
-* **Fail-Fast Error Classification:**
-  * Non-retryable: 400, 401, 403, 404, 405, 410, SSRF rejection, HTML landing pages, 0-byte responses, unmounted/unwritable Drive destination, and user cancellations fail immediately without burning retries.
-  * Retryable: 408, 429, 5xx server errors, connection resets, and chunk read timeouts cleanly retry up to `MAX_RETRIES`.
-* **Clean Retry Semantics (No Resume):** Incomplete partial downloads are discarded upon failure or cancellation; retries restart clean streams from byte 0 to prevent byte corruption.
+* **Step-by-Step Redirect SSRF Validation:** Transfers follow redirects manually, re-validating DNS resolution and IP addresses on EVERY redirect target before sending requests. Blocks localhost, 127.0.0.1, private IP ranges (10.x, 172.16.x, 192.168.x), link-local, multicast, and cloud metadata endpoints (`metadata.google.internal`).
+* **Exponential Backoff with Jitter:** Retries transient failures with configurable exponential backoff (`RETRY_INITIAL_DELAY` to `RETRY_MAX_DELAY`), respecting user cancellation between retries.
+* **Resource Cleanup:** Guaranteed context manager and explicit `.close()` calls on requests response and session across success, error, and cancellation paths.
+* **Logging & Error Sanitization:** Eliminates leakage of authorization headers, tokens, or query strings in logs (`sanitize_url_for_logging`) and user messages (`humanize_error`).
+* **Clean Retry Semantics (No Resume):** Interrupted downloads restart clean streams from byte 0 to guarantee cryptographic integrity.
 
 ## Google Drive Storage & Finalization (Milestone 4)
 

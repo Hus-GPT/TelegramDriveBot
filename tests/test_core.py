@@ -23,6 +23,7 @@ from app.transfer import (
     hash_file,
     parse_content_disposition,
     safe_filename,
+    sanitize_url_for_logging,
     validate_destination_directory,
     validate_url_security,
 )
@@ -514,6 +515,7 @@ def test_download_error_classification(temp_dirs):
             self._content = content
             self.headers = headers or {}
             self.url = "http://example.com/file.bin"
+            self.is_redirect = False
 
         def raise_for_status(self):
             if 400 <= self.status_code < 600:
@@ -521,6 +523,9 @@ def test_download_error_classification(temp_dirs):
 
         def iter_content(self, chunk_size=1024):
             yield self._content
+
+        def close(self):
+            pass
 
     with patch("requests.Session.get", return_value=MockResponse(404)):
         with pytest.raises(NonRetryableTransferError):
@@ -540,11 +545,11 @@ def test_download_error_classification(temp_dirs):
 
     with patch("requests.Session.get", return_value=MockResponse(500)):
         with pytest.raises(RetryableTransferError):
-            download_url("http://example.com/500", staging, max_retries=2)
+            download_url("http://example.com/500", staging, max_retries=2, sleep_fn=lambda _: None)
 
     with patch("requests.Session.get", return_value=MockResponse(429)):
         with pytest.raises(RetryableTransferError):
-            download_url("http://example.com/429", staging, max_retries=2)
+            download_url("http://example.com/429", staging, max_retries=2, sleep_fn=lambda _: None)
 
 
 def test_owner_authorization(temp_dirs):
@@ -787,7 +792,7 @@ async def test_ui_failure_isolation():
 
 
 # ---------------------------------------------------------
-# 10. Download Engine Hardening (Milestone 3)
+# 10. Download Engine Hardening (Milestone 3 & Audit)
 # ---------------------------------------------------------
 
 def test_url_security_ssrf_and_schemes():
@@ -832,6 +837,7 @@ def test_download_streaming_and_content_length_limit(temp_dirs):
             self.headers = headers or {}
             self.url = "https://example.com/stream.bin"
             self._chunks = chunks or [b"chunk1", b"chunk2", b"chunk3"]
+            self.is_redirect = False
 
         def raise_for_status(self):
             pass
@@ -839,6 +845,9 @@ def test_download_streaming_and_content_length_limit(temp_dirs):
         def iter_content(self, chunk_size=1024):
             for c in self._chunks:
                 yield c
+
+        def close(self):
+            pass
 
     with patch("requests.Session.get", return_value=MockResponse(headers={"Content-Length": "18"})):
         path, fname, size = download_url("https://example.com/stream.bin", staging)
@@ -867,6 +876,7 @@ def test_download_cancellation_during_streaming_cleans_partial(temp_dirs):
             self.status_code = 200
             self.headers = {"Content-Length": "5000"}
             self.url = "https://example.com/large.bin"
+            self.is_redirect = False
 
         def raise_for_status(self):
             pass
@@ -875,6 +885,9 @@ def test_download_cancellation_during_streaming_cleans_partial(temp_dirs):
             yield b"first chunk"
             cancel_evt.set()
             yield b"second chunk"
+
+        def close(self):
+            pass
 
     with patch("requests.Session.get", return_value=CancellableResponse()):
         with pytest.raises(NonRetryableTransferError) as exc:
@@ -892,10 +905,11 @@ def test_download_redirect_and_content_disposition_precedence(temp_dirs):
         def __init__(self):
             self.status_code = 200
             self.headers = {
-                "Content-Length": "12",
+                "Content-Length": "13",
                 "Content-Disposition": 'attachment; filename="final_document.pdf"',
             }
             self.url = "https://cdn.example.org/downloads/v1/download?id=999"
+            self.is_redirect = False
 
         def raise_for_status(self):
             pass
@@ -903,9 +917,12 @@ def test_download_redirect_and_content_disposition_precedence(temp_dirs):
         def iter_content(self, chunk_size=1024):
             yield b"valid content"
 
+        def close(self):
+            pass
+
     with patch("requests.Session.get", return_value=RedirectResponse()):
         path, resolved_name, size = download_url(
-            "https://short.link/xyz",
+            "https://example.com/xyz",
             staging,
             custom_filename=None,
         )
@@ -1085,32 +1102,28 @@ async def test_cmd_status_job_detail_mode(temp_dirs):
     assert "completed" in msg
 
 
-# =========================================================
-# MILESTONE 6: Telegram UX & Owner Control Tests
-# =================================------------------------
+# ---------------------------------------------------------
+# 13. Telegram UX & Owner Control Tests (Milestone 6)
+# ---------------------------------------------------------
 
 def test_ui_keyboards_builder():
     main_kb = build_main_keyboard()
     assert main_kb is not None
     assert len(main_kb.inline_keyboard) == 2
 
-    # Active/Queued job keyboard: should have Cancel button
     q_kb = build_job_action_keyboard("j_test", "queued")
     assert q_kb is not None
     assert "ask_cancel_j_test" in q_kb.inline_keyboard[0][0].callback_data
 
-    # Failed job keyboard: should have Retry button
     f_kb = build_job_action_keyboard("j_test", "failed")
     assert f_kb is not None
     assert "ask_retry_j_test" in f_kb.inline_keyboard[0][0].callback_data
 
-    # Completed job: should NOT have cancel or retry button
     c_kb = build_job_action_keyboard("j_test", "completed")
     assert c_kb is not None
     data_all = [btn.callback_data for row in c_kb.inline_keyboard for btn in row]
     assert not any("cancel" in d or "retry" in d for d in data_all)
 
-    # Confirmation keyboards
     conf_c = build_confirmation_keyboard("cancel", "j_test")
     assert "do_cancel_j_test" in conf_c.inline_keyboard[0][0].callback_data
 
@@ -1130,7 +1143,6 @@ async def test_callback_unauthorized_rejected(temp_dirs):
     )
     app = TelegramDriveBotApp(cfg)
 
-    # Unauthorized callback
     update = MagicMock()
     update.effective_user.id = 999999
     update.callback_query.answer = AsyncMock()
@@ -1161,19 +1173,16 @@ async def test_callback_navigation_actions(temp_dirs):
     update.callback_query.answer = AsyncMock()
     context = MagicMock()
 
-    # 1. nav_status
     update.callback_query.data = "nav_status"
     await app.handle_callback_query(update, context)
     app.application.bot.edit_message_text.assert_called()
     assert "حالة النظام التشغيلية" in app.application.bot.edit_message_text.call_args[1]["text"]
 
-    # 2. nav_storage
     app.application.bot.edit_message_text.reset_mock()
     update.callback_query.data = "nav_storage"
     await app.handle_callback_query(update, context)
     assert "تشخيص وسائط التخزين" in app.application.bot.edit_message_text.call_args[1]["text"]
 
-    # 3. nav_history
     app.application.bot.edit_message_text.reset_mock()
     update.callback_query.data = "nav_history"
     await app.handle_callback_query(update, context)
@@ -1194,7 +1203,6 @@ async def test_callback_confirmation_and_execution_lifecycle(temp_dirs):
     app.application = MagicMock()
     app.application.bot.edit_message_text = AsyncMock()
 
-    # Prepare failed job
     app.state.add_job("j_cb_retry", "direct_url", "failed.bin", 777, 777)
     app.state.update_job("j_cb_retry", status="failed")
 
@@ -1205,13 +1213,11 @@ async def test_callback_confirmation_and_execution_lifecycle(temp_dirs):
     update.callback_query.answer = AsyncMock()
     context = MagicMock()
 
-    # 1. Step A: Prompt confirmation
     update.callback_query.data = "ask_retry_j_cb_retry"
     await app.handle_callback_query(update, context)
     prompt_text = app.application.bot.edit_message_text.call_args[1]["text"]
     assert "إعادة جدولة المهمة" in prompt_text
 
-    # 2. Step B: Execute confirmation
     app.application.bot.edit_message_text.reset_mock()
     update.callback_query.data = "do_retry_j_cb_retry"
     await app.handle_callback_query(update, context)
@@ -1233,7 +1239,6 @@ async def test_callback_stale_button_protection(temp_dirs):
     )
     app = TelegramDriveBotApp(cfg)
 
-    # Job is already completed in backend
     app.state.add_job("j_stale", "direct_url", "completed.bin", 777, 777)
     app.state.update_job("j_stale", status="downloading")
     app.state.update_job("j_stale", status="downloaded")
@@ -1245,9 +1250,231 @@ async def test_callback_stale_button_protection(temp_dirs):
     update.callback_query.answer = AsyncMock()
     context = MagicMock()
 
-    # User clicks stale "ask_cancel" on completed job
     update.callback_query.data = "ask_cancel_j_stale"
     await app.handle_callback_query(update, context)
     update.callback_query.answer.assert_called_with("⚠️ لا يمكن إلغاء هذه المهمة (حالتها تغيرت بالفعل).", show_alert=True)
-    # Status remains completed
     assert app.state.get_job("j_stale")["status"] == "completed"
+
+
+# =========================================================
+# 14. Global Correction Suite (SSRF, Backoff, Safety & Routing)
+# =========================================================
+
+def test_ssrf_redirect_protection_cases(temp_dirs):
+    staging, _ = temp_dirs
+
+    class MockRedirectResponse:
+        def __init__(self, location, status_code=302):
+            self.status_code = status_code
+            self.headers = {"Location": location}
+            self.is_redirect = True
+
+        def close(self):
+            pass
+
+    # 1. Public -> Localhost redirect rejected
+    with patch("requests.Session.get", return_value=MockRedirectResponse("http://127.0.0.1:8080/secret")):
+        with pytest.raises(NonRetryableTransferError) as exc:
+            download_url("https://public-cdn.example.org/start", staging)
+        assert "SSRF Protection" in str(exc.value)
+
+    # 2. Public -> Private IP redirect rejected
+    with patch("requests.Session.get", return_value=MockRedirectResponse("http://192.168.1.100/admin")):
+        with pytest.raises(NonRetryableTransferError) as exc:
+            download_url("https://public-cdn.example.org/start", staging)
+        assert "SSRF Protection" in str(exc.value)
+
+    # 3. Public -> Cloud metadata endpoint redirect rejected
+    with patch("requests.Session.get", return_value=MockRedirectResponse("http://metadata.google.internal/v1")):
+        with pytest.raises(NonRetryableTransferError) as exc:
+            download_url("https://public-cdn.example.org/start", staging)
+        assert "SSRF Protection" in str(exc.value)
+
+    # 4. Hostname resolving to private IP rejected
+    with patch("socket.getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 80))]):
+        with pytest.raises(NonRetryableTransferError) as exc:
+            validate_url_security("http://evil-private-redirect.org/file")
+        assert "يحل إلى عنوان IP داخلي" in str(exc.value)
+
+    # 5. IPv6 private/link-local address rejected
+    with pytest.raises(NonRetryableTransferError):
+        validate_url_security("http://[fe80::1]/file")
+
+    # 6. Redirect loop / exceeded limit
+    with patch("requests.Session.get", return_value=MockRedirectResponse("https://public-cdn.example.org/loop")):
+        with pytest.raises(NonRetryableTransferError) as exc:
+            download_url("https://public-cdn.example.org/start", staging, max_redirects=3)
+        assert "تم تجاوز الحد الأقصى لإعادة التوجيه" in str(exc.value)
+
+
+def test_retry_exponential_backoff_sleep_injection(temp_dirs):
+    staging, _ = temp_dirs
+
+    class MockFailingResponse:
+        def __init__(self):
+            self.status_code = 503
+            self.is_redirect = False
+
+        def raise_for_status(self):
+            raise requests.HTTPError("503 Service Unavailable")
+
+        def close(self):
+            pass
+
+    sleep_calls = []
+
+    def mock_sleep(sec):
+        sleep_calls.append(sec)
+
+    with patch("requests.Session.get", return_value=MockFailingResponse()):
+        with pytest.raises(RetryableTransferError):
+            download_url(
+                "https://public-cdn.example.org/flaky",
+                staging,
+                max_retries=3,
+                sleep_fn=mock_sleep,
+                retry_base_delay=2.0,
+                retry_max_delay=10.0,
+            )
+
+    # Exactly 2 backoff sleeps for 3 attempts (between 1->2 and 2->3)
+    assert len(sleep_calls) == 2
+    # Verify exponential progression: attempt 1 base 2.0, attempt 2 base 4.0
+    assert 2.0 <= sleep_calls[0] <= 3.0
+    assert 4.0 <= sleep_calls[1] <= 6.0
+
+
+@pytest.mark.asyncio
+async def test_active_cancel_requires_confirmation(temp_dirs):
+    staging, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=777,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+    app.application = MagicMock()
+    app.application.bot.edit_message_text = AsyncMock()
+
+    app.state.add_job("j_active_confirm", "direct_url", "active.bin", 777, 777)
+    app.state.update_job("j_active_confirm", status="downloading")
+    app.active_jobs["j_active_confirm"] = app.state.get_job("j_active_confirm")
+
+    update = MagicMock()
+    update.effective_user.id = 777
+    update.callback_query.message.chat_id = 123
+    update.callback_query.message.message_id = 456
+    update.callback_query.answer = AsyncMock()
+    context = MagicMock()
+
+    # Step 1: User taps "Cancel Active" from dashboard
+    update.callback_query.data = "act_cancel_active"
+    await app.handle_callback_query(update, context)
+
+    # Must present confirmation UI, NOT cancel immediately
+    prompt = app.application.bot.edit_message_text.call_args[1]["text"]
+    assert "هل أنت متأكد من إلغاء المهمة الجارية" in prompt
+    assert app.state.get_job("j_active_confirm")["status"] == "downloading"
+    assert "j_active_confirm" in app.active_jobs
+
+    # Step 2: User confirms cancellation
+    app.application.bot.edit_message_text.reset_mock()
+    update.callback_query.data = "do_cancel_j_active_confirm"
+    await app.handle_callback_query(update, context)
+
+    # Now it is cancelled
+    assert app.state.get_job("j_active_confirm")["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_status_deep_link_command_routing(temp_dirs):
+    staging, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=777,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+
+    app.state.add_job("j_route123", "direct_url", "routed.bin", 777, 777)
+    app.state.update_job("j_route123", status="completed")
+
+    update = MagicMock()
+    update.effective_user.id = 777
+    update.effective_message.text = "/status_j_route123"
+    update.effective_message.reply_text = AsyncMock()
+    context = MagicMock()
+
+    await app.cmd_status_deep_link(update, context)
+    update.effective_message.reply_text.assert_called_once()
+    reply = update.effective_message.reply_text.call_args[0][0]
+    assert "تفاصيل المهمة" in reply
+    assert "j_route123" in reply
+    assert "routed.bin" in reply
+
+
+def test_sanitize_url_and_render_error_security(temp_dirs):
+    # 1. URL logging redaction
+    sensitive_url = "https://user:password@storage.example.org/download?token=secret123&key=private456"
+    sanitized = sanitize_url_for_logging(sensitive_url)
+    assert "secret123" not in sanitized
+    assert "password" not in sanitized
+    assert "storage.example.org" in sanitized
+
+    # 2. Render job detail hides raw stack traces/tokens
+    staging, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=777,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+    job = app.state.add_job("j_sec", "direct_url", "test.bin", 777, 777)
+    app.state.update_job(job["id"], status="failed", error="SensitiveToken12345 leaked in internal exception")
+
+    detail = app.render_job_detail_text(app.state.get_job(job["id"]))
+    assert "SensitiveToken12345" not in detail
+    assert "تعذر إكمال عملية النقل بسبب خطأ غير متوقع" in detail
+
+
+@pytest.mark.asyncio
+async def test_callback_stale_and_race_prevention(temp_dirs):
+    staging, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=777,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+    app.application = MagicMock()
+    app.application.bot.edit_message_text = AsyncMock()
+
+    # Case B: User opened confirmation to cancel, but in background job completed!
+    app.state.add_job("j_race", "direct_url", "race.bin", 777, 777)
+    app.state.update_job("j_race", status="downloading")
+    app.state.update_job("j_race", status="downloaded")
+    app.state.update_job("j_race", status="verifying")
+    app.state.update_job("j_race", status="completed")
+
+    update = MagicMock()
+    update.effective_user.id = 777
+    update.callback_query.message.chat_id = 123
+    update.callback_query.message.message_id = 456
+    update.callback_query.answer = AsyncMock()
+    context = MagicMock()
+
+    # User taps "do_cancel_j_race"
+    update.callback_query.data = "do_cancel_j_race"
+    await app.handle_callback_query(update, context)
+
+    # Must be safely rejected, and job remains completed!
+    update.callback_query.answer.assert_called_with("⚠️ تعذر الإلغاء: حالة المهمة تغيرت بالفعل في النظام.", show_alert=True)
+    assert app.state.get_job("j_race")["status"] == "completed"
