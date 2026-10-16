@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import socket
 import tempfile
 import threading
 import pytest
