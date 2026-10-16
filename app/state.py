@@ -118,25 +118,35 @@ class StateStore:
             logger.error("Failed creating corrupt state backup: %s", exc)
 
     def _save(self) -> None:
-        """Atomically write state using a temporary file in the same directory."""
+        """Atomically write state while retaining active jobs and the newest terminal history."""
         state_dir = os.path.dirname(self.state_path)
         os.makedirs(state_dir, exist_ok=True)
 
-        # Enforce history retention to keep JSON bounded without deleting active/recovery jobs
         jobs = self.data.get("jobs", [])
         if len(jobs) > self.max_history:
-            terminal_jobs = [j for j in jobs if j.get("status") in {"completed", "failed", "cancelled"}]
-            active_jobs = [j for j in jobs if j.get("status") not in {"completed", "failed", "cancelled"}]
-            excess = len(jobs) - self.max_history
-            if excess > 0 and terminal_jobs:
-                pruned_terminal = terminal_jobs[excess:]
-                self.data["jobs"] = active_jobs + pruned_terminal
+            terminal_states = {"completed", "failed", "cancelled"}
+            active_jobs = [job for job in jobs if job.get("status") not in terminal_states]
+            terminal_jobs = [job for job in jobs if job.get("status") in terminal_states]
+
+            # Keep the most recently updated terminal jobs. The previous implementation
+            # sliced by list position after moving active jobs to the front, which could
+            # discard the newest job as soon as it became terminal.
+            terminal_jobs.sort(
+                key=lambda job: job.get("updated_at") or job.get("created_at") or "",
+                reverse=True,
+            )
+            available_terminal_slots = max(0, self.max_history - len(active_jobs))
+            retained_terminal_ids = {job.get("id") for job in terminal_jobs[:available_terminal_slots]}
+            self.data["jobs"] = [
+                job for job in jobs
+                if job.get("status") not in terminal_states or job.get("id") in retained_terminal_ids
+            ]
 
         self._recalculate_stats()
 
         tmp_fd, tmp_path = tempfile.mkstemp(dir=state_dir, prefix="state_", suffix=".tmp")
         try:
-            with open(tmp_fd, "w", encoding="utf-8") as f:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, indent=2, ensure_ascii=False)
             os.replace(tmp_path, self.state_path)
         except Exception:
@@ -159,7 +169,6 @@ class StateStore:
         telegram_message_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         with self._lock:
-            # Check for existing job with same ID
             for j in self.data.get("jobs", []):
                 if j.get("id") == str(job_id):
                     return dict(j)
@@ -205,8 +214,6 @@ class StateStore:
                             raise InvalidStateTransitionError(
                                 f"انتقال حالة غير مسموح به برمجياً من '{old_status}' إلى '{new_status}' للمهمة {job_id}"
                             )
-
-                        # Set timestamps automatically for lifecycle milestones
                         if new_status == "downloading" and not job.get("started_at"):
                             job["started_at"] = now_utc_iso()
                         elif new_status in {"completed", "failed", "cancelled"}:
@@ -217,65 +224,3 @@ class StateStore:
                     self._save()
                     return dict(job)
             return None
-
-    def retry_job(self, job_id: str) -> Optional[Dict[str, Any]]:
-        """Controlled path to transition a failed or cancelled job back to queued."""
-        with self._lock:
-            for job in self.data.get("jobs", []):
-                if job.get("id") == str(job_id):
-                    current_status = job.get("status")
-                    if current_status not in {"failed", "cancelled"}:
-                        raise InvalidStateTransitionError(
-                            f"لا يمكن إعادة تشغيل المهمة {job_id} لأنها في حالة: {current_status}"
-                        )
-                    job["status"] = "queued"
-                    job["error"] = None
-                    job["retries"] = job.get("retries", 0) + 1
-                    job["started_at"] = None
-                    job["completed_at"] = None
-                    job["recovery_from_status"] = current_status
-                    job["updated_at"] = now_utc_iso()
-                    self._save()
-                    return dict(job)
-            return None
-
-    def recover_job(self, job_id: str, target_status: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
-        """Controlled path for startup crash recovery only."""
-        with self._lock:
-            for job in self.data.get("jobs", []):
-                if job.get("id") == str(job_id):
-                    if target_status not in VALID_STATES:
-                        raise InvalidStateTransitionError(f"حالة استعادة غير صالحة: {target_status}")
-                    current_status = job.get("status")
-                    job["recovery_from_status"] = current_status
-                    job["recovery_at"] = now_utc_iso()
-                    job["status"] = target_status
-                    if target_status == "queued":
-                        job["started_at"] = None
-                    job.update(kwargs)
-                    job["updated_at"] = now_utc_iso()
-                    self._save()
-                    return dict(job)
-            return None
-
-    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            for job in self.data.get("jobs", []):
-                if job.get("id") == str(job_id):
-                    return dict(job)
-            return None
-
-    def unfinished_jobs(self) -> List[Dict[str, Any]]:
-        with self._lock:
-            active_statuses = {"queued", "downloading", "downloaded", "verifying"}
-            return [dict(j) for j in self.data.get("jobs", []) if j.get("status") in active_statuses]
-
-    def all_jobs(self) -> List[Dict[str, Any]]:
-        with self._lock:
-            return [dict(j) for j in self.data.get("jobs", [])]
-
-    def clear_active_for_recovery(self) -> None:
-        """Utility for test isolation."""
-        with self._lock:
-            self.data["jobs"] = [j for j in self.data.get("jobs", []) if j.get("status") in {"completed", "failed", "cancelled"}]
-            self._save()
