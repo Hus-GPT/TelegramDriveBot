@@ -684,6 +684,7 @@ async def test_cmd_status_and_history(temp_dirs):
     update.effective_user.id = 777
     update.effective_message.reply_text = AsyncMock()
     context = MagicMock()
+    context.args = []
 
     await app.cmd_status(update, context)
     status_text = update.effective_message.reply_text.call_args[0][0]
