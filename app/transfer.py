@@ -464,21 +464,35 @@ def get_storage_diagnostics(staging_dir: str, drive_dir: str) -> StorageDiagnost
 
 
 def clean_orphan_drive_partials(destination_dir: str, state_store: Any) -> List[str]:
-    """Safely removes only orphaned .part_<job_id>_* files from Google Drive destination."""
+    """Safely remove orphaned .part_<job_id>_* files without misparsing IDs containing underscores."""
     cleaned: List[str] = []
     if not os.path.exists(destination_dir):
         return cleaned
 
+    known_jobs = state_store.all_jobs() if hasattr(state_store, "all_jobs") else []
+    known_ids = sorted(
+        (str(job.get("id")) for job in known_jobs if job.get("id") is not None),
+        key=len,
+        reverse=True,
+    )
+
     pattern = os.path.join(destination_dir, ".part_*_*")
     for part_path in glob.glob(pattern):
         filename = os.path.basename(part_path)
-        match = re.match(r"^\.part_([^_]+)_(.+)$", filename)
-        if not match:
-            continue
+        job_id = next(
+            (candidate for candidate in known_ids if filename.startswith(f".part_{candidate}_")),
+            None,
+        )
 
-        job_id = match.group(1)
+        # If no stored job matches, the file is orphaned. The greedy fallback is only
+        # used to validate the established filename convention, never to preserve a job.
+        if job_id is None:
+            match = re.match(r"^\.part_(.+)_(.+)$", filename)
+            if not match:
+                continue
+            job_id = match.group(1)
+
         job = state_store.get_job(job_id) if hasattr(state_store, "get_job") else None
-
         if not job or job.get("status") in {"completed", "failed", "cancelled"}:
             try:
                 os.remove(part_path)
