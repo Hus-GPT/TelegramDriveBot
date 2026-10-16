@@ -46,6 +46,14 @@ def temp_dirs():
         yield staging, drive
 
 
+def complete_job_for_test(store, job_id, **kwargs):
+    """Move a queued test job through the real lifecycle before completing it."""
+    store.update_job(job_id, status="downloading")
+    store.update_job(job_id, status="downloaded")
+    store.update_job(job_id, status="verifying")
+    return store.update_job(job_id, status="completed", **kwargs)
+
+
 # ---------------------------------------------------------
 # 1. State Machine & Transition Tests (Milestone 1 Core)
 # ---------------------------------------------------------
@@ -307,7 +315,7 @@ def test_clean_orphan_drive_partials(temp_dirs):
         f.write(b"in flight")
 
     store.add_job("j_done", "direct_url", "done.bin", 1, 2)
-    store.update_job("j_done", status="completed")
+    complete_job_for_test(store, "j_done")
     part_done = os.path.join(drive, ".part_j_done_done.bin")
     with open(part_done, "wb") as f:
         f.write(b"leftover")
@@ -666,7 +674,7 @@ async def test_cmd_status_and_history(temp_dirs):
     app = TelegramDriveBotApp(cfg)
 
     app.state.add_job("j_done1", "direct_url", "file1.bin", 777, 777)
-    app.state.update_job("j_done1", status="completed", size=1024 * 1024)
+    complete_job_for_test(app.state, "j_done1", size=1024 * 1024)
 
     app.state.add_job("j_act", "direct_url", "file_active.bin", 777, 777)
     app.state.update_job("j_act", status="downloading", size=2 * 1024 * 1024)
@@ -723,7 +731,7 @@ async def test_cmd_cancel_modes(temp_dirs):
     assert app.state.get_job("j_active_canc")["status"] == "cancelled"
 
     app.state.add_job("j_done_canc", "direct_url", "done.bin", 777, 777)
-    app.state.update_job("j_done_canc", status="completed")
+    complete_job_for_test(app.state, "j_done_canc")
     context.args = ["j_done_canc"]
     update.effective_message.reply_text.reset_mock()
     await app.cmd_cancel(update, context)
@@ -759,7 +767,7 @@ async def test_cmd_retry_validation(temp_dirs):
     assert "جارية أو في الانتظار بالفعل" in update.effective_message.reply_text.call_args[0][0]
 
     app.state.add_job("j_comp_ret", "direct_url", "c.bin", 777, 777)
-    app.state.update_job("j_comp_ret", status="completed")
+    complete_job_for_test(app.state, "j_comp_ret")
     context.args = ["j_comp_ret"]
     update.effective_message.reply_text.reset_mock()
     await app.cmd_retry(update, context)
@@ -1402,7 +1410,7 @@ async def test_status_deep_link_command_routing(temp_dirs):
     app = TelegramDriveBotApp(cfg)
 
     app.state.add_job("j_route123", "direct_url", "routed.bin", 777, 777)
-    app.state.update_job("j_route123", status="completed")
+    complete_job_for_test(app.state, "j_route123")
 
     update = MagicMock()
     update.effective_user.id = 777
