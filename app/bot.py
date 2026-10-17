@@ -985,6 +985,43 @@ class TelegramDriveBotApp:
             job_id = job["id"]
             temp_path = job.get("temp_path")
 
+            # Crash window: Drive final file may already be fully copied and verified,
+            # while the process died before persisting status="completed". Confirm the
+            # destination content before deciding whether another download is needed.
+            destination_path = job.get("destination_path")
+            expected_sha = job.get("sha256")
+            expected_size = job.get("size")
+            if status == "verifying" and destination_path and os.path.isfile(destination_path):
+                try:
+                    drive_sha, drive_size = hash_file(destination_path)
+                    if (
+                        drive_size > 0
+                        and expected_sha
+                        and expected_size is not None
+                        and drive_sha == expected_sha
+                        and drive_size == expected_size
+                    ):
+                        self.state.recover_job(
+                            job_id,
+                            "completed",
+                            sha256=drive_sha,
+                            size=drive_size,
+                            destination_path=destination_path,
+                            error=None,
+                        )
+                        if temp_path and os.path.exists(temp_path):
+                            try:
+                                os.remove(temp_path)
+                            except OSError:
+                                pass
+                        logger.info(
+                            "[job=%s] Recovery verified final Drive file; marked completed without re-download.",
+                            job_id,
+                        )
+                        continue
+                except OSError as exc:
+                    logger.warning("[job=%s] Could not verify existing Drive destination during recovery: %s", job_id, exc)
+
             if status in {"queued", "downloading"}:
                 if temp_path and os.path.exists(temp_path):
                     try:
