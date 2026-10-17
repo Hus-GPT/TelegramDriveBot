@@ -51,6 +51,27 @@ logger = logging.getLogger(__name__)
 
 URL_REGEX = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
+def extract_message_media(message: Any) -> Tuple[Optional[Any], str]:
+    """Return the best file-bearing Telegram message object and its media kind."""
+    photo_sizes = getattr(message, "photo", None)
+    if photo_sizes:
+        return max(photo_sizes, key=lambda photo: getattr(photo, "file_size", 0) or 0), "photo"
+
+    for attribute, kind in (
+        ("document", "document"),
+        ("video", "video"),
+        ("audio", "audio"),
+        ("voice", "voice"),
+        ("animation", "animation"),
+        ("video_note", "video_note"),
+        ("sticker", "sticker"),
+    ):
+        media = getattr(message, attribute, None)
+        if media:
+            return media, kind
+    return None, "media"
+
+
 
 class File2URLProvider:
     """Serialized single-worker provider for large Telegram files via Bot-to-Bot forward."""
@@ -671,34 +692,7 @@ class TelegramDriveBotApp:
             return
 
         # Media Attachment — support common Telegram file-bearing message types.
-        media = (
-            message.document
-            or message.video
-            or message.audio
-            or message.voice
-            or message.animation
-            or message.video_note
-            or message.sticker
-        )
-        media_kind = "media"
-        if message.photo:
-            # Telegram exposes photos as multiple sizes; download the largest available one.
-            media = max(message.photo, key=lambda photo: getattr(photo, "file_size", 0) or 0)
-            media_kind = "photo"
-        elif message.document:
-            media_kind = "document"
-        elif message.video:
-            media_kind = "video"
-        elif message.audio:
-            media_kind = "audio"
-        elif message.voice:
-            media_kind = "voice"
-        elif message.animation:
-            media_kind = "animation"
-        elif message.video_note:
-            media_kind = "video_note"
-        elif message.sticker:
-            media_kind = "sticker"
+        media, media_kind = extract_message_media(message)
 
         if media:
             job_id = str(uuid.uuid4())[:8]
