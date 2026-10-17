@@ -454,6 +454,54 @@ def test_restore_unfinished_branches(temp_dirs):
     assert app.state.get_job("j_ver")["status"] == "downloaded"
 
 
+def test_restore_marks_verified_drive_file_completed_after_crash(temp_dirs):
+    staging, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=123456,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+
+    payload = b"verified in Drive before state commit"
+    sha, size = hashlib.sha256(payload).hexdigest(), len(payload)
+    destination = os.path.join(drive, "already_copied.bin")
+    with open(destination, "wb") as f:
+        f.write(payload)
+
+    staged = os.path.join(staging, "staged.bin")
+    with open(staged, "wb") as f:
+        f.write(payload)
+
+    app.state.add_job("j_drive_commit_crash", "direct_url", "already_copied.bin", 1, 2)
+    app.state.update_job("j_drive_commit_crash", status="downloading")
+    app.state.update_job(
+        "j_drive_commit_crash",
+        status="downloaded",
+        temp_path=staged,
+        sha256=sha,
+        size=size,
+    )
+    app.state.update_job(
+        "j_drive_commit_crash",
+        status="verifying",
+        destination_path=destination,
+    )
+
+    app.restore_unfinished()
+
+    recovered = app.state.get_job("j_drive_commit_crash")
+    assert recovered["status"] == "completed"
+    assert recovered["destination_path"] == destination
+    assert recovered["sha256"] == sha
+    assert recovered["size"] == size
+    assert app.queue.empty()
+    assert os.path.exists(destination)
+    assert not os.path.exists(staged)
+
+
 def test_recovery_idempotency(temp_dirs):
     staging, drive = temp_dirs
     cfg = Config(
