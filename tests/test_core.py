@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import socket
 import tempfile
 import threading
 import pytest
@@ -27,7 +28,7 @@ from app.transfer import (
     validate_destination_directory,
     validate_url_security,
 )
-from app.bot import File2URLProvider, TelegramDriveBotApp
+from app.bot import File2URLProvider, TelegramDriveBotApp, extract_message_media
 from app.ui import (
     ProgressTracker,
     build_confirmation_keyboard,
@@ -43,6 +44,14 @@ from app.ui import (
 def temp_dirs():
     with tempfile.TemporaryDirectory() as staging, tempfile.TemporaryDirectory() as drive:
         yield staging, drive
+
+
+def complete_job_for_test(store, job_id, **kwargs):
+    """Move a queued test job through the real lifecycle before completing it."""
+    store.update_job(job_id, status="downloading")
+    store.update_job(job_id, status="downloaded")
+    store.update_job(job_id, status="verifying")
+    return store.update_job(job_id, status="completed", **kwargs)
 
 
 # ---------------------------------------------------------
@@ -306,7 +315,7 @@ def test_clean_orphan_drive_partials(temp_dirs):
         f.write(b"in flight")
 
     store.add_job("j_done", "direct_url", "done.bin", 1, 2)
-    store.update_job("j_done", status="completed")
+    complete_job_for_test(store, "j_done")
     part_done = os.path.join(drive, ".part_j_done_done.bin")
     with open(part_done, "wb") as f:
         f.write(b"leftover")
@@ -321,6 +330,52 @@ def test_clean_orphan_drive_partials(temp_dirs):
 
     assert os.path.exists(part_active)
     assert os.path.exists(unrelated)
+
+
+# ---------------------------------------------------------
+# 5. Telegram media selection coverage
+# ---------------------------------------------------------
+
+def test_extract_message_media_selects_largest_photo():
+    small = type("Photo", (), {"file_size": 120, "file_id": "small"})()
+    large = type("Photo", (), {"file_size": 900, "file_id": "large"})()
+    message = type("Message", (), {"photo": [small, large]})()
+
+    media, kind = extract_message_media(message)
+
+    assert media is large
+    assert kind == "photo"
+
+
+@pytest.mark.parametrize(
+    ("attribute", "kind"),
+    [
+        ("voice", "voice"),
+        ("animation", "animation"),
+        ("video_note", "video_note"),
+        ("sticker", "sticker"),
+        ("document", "document"),
+        ("video", "video"),
+        ("audio", "audio"),
+    ],
+)
+def test_extract_message_media_supports_other_types(attribute, kind):
+    media_object = object()
+    message = type("Message", (), {attribute: media_object})()
+
+    media, actual_kind = extract_message_media(message)
+
+    assert media is media_object
+    assert actual_kind == kind
+
+
+def test_extract_message_media_returns_none_for_text_only_message():
+    message = type("Message", (), {})()
+
+    media, kind = extract_message_media(message)
+
+    assert media is None
+    assert kind == "media"
 
 
 # ---------------------------------------------------------
@@ -443,6 +498,54 @@ def test_restore_unfinished_branches(temp_dirs):
 
     assert not os.path.exists(dest_part)
     assert app.state.get_job("j_ver")["status"] == "downloaded"
+
+
+def test_restore_marks_verified_drive_file_completed_after_crash(temp_dirs):
+    staging, drive = temp_dirs
+    cfg = Config(
+        TELEGRAM_BOT_TOKEN="mock_token",
+        OWNER_ID=123456,
+        DRIVE_DESTINATION=drive,
+        LOCAL_STAGING_DIR=staging,
+        STATE_PATH=os.path.join(drive, "state.json"),
+    )
+    app = TelegramDriveBotApp(cfg)
+
+    payload = b"verified in Drive before state commit"
+    sha, size = hashlib.sha256(payload).hexdigest(), len(payload)
+    destination = os.path.join(drive, "already_copied.bin")
+    with open(destination, "wb") as f:
+        f.write(payload)
+
+    staged = os.path.join(staging, "staged.bin")
+    with open(staged, "wb") as f:
+        f.write(payload)
+
+    app.state.add_job("j_drive_commit_crash", "direct_url", "already_copied.bin", 1, 2)
+    app.state.update_job("j_drive_commit_crash", status="downloading")
+    app.state.update_job(
+        "j_drive_commit_crash",
+        status="downloaded",
+        temp_path=staged,
+        sha256=sha,
+        size=size,
+    )
+    app.state.update_job(
+        "j_drive_commit_crash",
+        status="verifying",
+        destination_path=destination,
+    )
+
+    app.restore_unfinished()
+
+    recovered = app.state.get_job("j_drive_commit_crash")
+    assert recovered["status"] == "completed"
+    assert recovered["destination_path"] == destination
+    assert recovered["sha256"] == sha
+    assert recovered["size"] == size
+    assert app.queue.empty()
+    assert os.path.exists(destination)
+    assert not os.path.exists(staged)
 
 
 def test_recovery_idempotency(temp_dirs):
@@ -665,7 +768,7 @@ async def test_cmd_status_and_history(temp_dirs):
     app = TelegramDriveBotApp(cfg)
 
     app.state.add_job("j_done1", "direct_url", "file1.bin", 777, 777)
-    app.state.update_job("j_done1", status="completed", size=1024 * 1024)
+    complete_job_for_test(app.state, "j_done1", size=1024 * 1024)
 
     app.state.add_job("j_act", "direct_url", "file_active.bin", 777, 777)
     app.state.update_job("j_act", status="downloading", size=2 * 1024 * 1024)
@@ -675,6 +778,7 @@ async def test_cmd_status_and_history(temp_dirs):
     update.effective_user.id = 777
     update.effective_message.reply_text = AsyncMock()
     context = MagicMock()
+    context.args = []
 
     await app.cmd_status(update, context)
     status_text = update.effective_message.reply_text.call_args[0][0]
@@ -722,7 +826,7 @@ async def test_cmd_cancel_modes(temp_dirs):
     assert app.state.get_job("j_active_canc")["status"] == "cancelled"
 
     app.state.add_job("j_done_canc", "direct_url", "done.bin", 777, 777)
-    app.state.update_job("j_done_canc", status="completed")
+    complete_job_for_test(app.state, "j_done_canc")
     context.args = ["j_done_canc"]
     update.effective_message.reply_text.reset_mock()
     await app.cmd_cancel(update, context)
@@ -758,7 +862,7 @@ async def test_cmd_retry_validation(temp_dirs):
     assert "جارية أو في الانتظار بالفعل" in update.effective_message.reply_text.call_args[0][0]
 
     app.state.add_job("j_comp_ret", "direct_url", "c.bin", 777, 777)
-    app.state.update_job("j_comp_ret", status="completed")
+    complete_job_for_test(app.state, "j_comp_ret")
     context.args = ["j_comp_ret"]
     update.effective_message.reply_text.reset_mock()
     await app.cmd_retry(update, context)
@@ -1401,7 +1505,7 @@ async def test_status_deep_link_command_routing(temp_dirs):
     app = TelegramDriveBotApp(cfg)
 
     app.state.add_job("j_route123", "direct_url", "routed.bin", 777, 777)
-    app.state.update_job("j_route123", status="completed")
+    complete_job_for_test(app.state, "j_route123")
 
     update = MagicMock()
     update.effective_user.id = 777

@@ -51,6 +51,27 @@ logger = logging.getLogger(__name__)
 
 URL_REGEX = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
+def extract_message_media(message: Any) -> Tuple[Optional[Any], str]:
+    """Return the best file-bearing Telegram message object and its media kind."""
+    photo_sizes = getattr(message, "photo", None)
+    if photo_sizes:
+        return max(photo_sizes, key=lambda photo: getattr(photo, "file_size", 0) or 0), "photo"
+
+    for attribute, kind in (
+        ("document", "document"),
+        ("video", "video"),
+        ("audio", "audio"),
+        ("voice", "voice"),
+        ("animation", "animation"),
+        ("video_note", "video_note"),
+        ("sticker", "sticker"),
+    ):
+        media = getattr(message, attribute, None)
+        if media:
+            return media, kind
+    return None, "media"
+
+
 
 class File2URLProvider:
     """Serialized single-worker provider for large Telegram files via Bot-to-Bot forward."""
@@ -299,7 +320,7 @@ class TelegramDriveBotApp:
             f"⚡ العمليات الجارية: {active_cnt} | ⏳ في الانتظار: {queue_cnt}\n\n"
             "📥 *طريقة الاستخدام:*\n"
             "• أرسل أي رابط تحميل مباشر (`https://...`)\n"
-            "• أرسل أي ملف، فيديو، مستند، أو صوت عبر تيليجرام\n\n"
+            "• أرسل ملفاً أو مستنداً أو صورة أو فيديو أو صوتاً أو ملصقاً عبر تيليجرام\n\n"
             "🔘 يمكنك استخدام لوحة التحكم السريعة أدناه أو كتابة الأوامر مباشرة:"
         )
         await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=build_main_keyboard())
@@ -670,13 +691,24 @@ class TelegramDriveBotApp:
             logger.info("[job=%s] Accepted direct URL job into queue: %s (source: %s)", job_id, fname, sanitized_log_url)
             return
 
-        # Media Attachment
-        media = message.document or message.video or message.audio
+        # Media Attachment — support common Telegram file-bearing message types.
+        media, media_kind = extract_message_media(message)
+
         if media:
             job_id = str(uuid.uuid4())[:8]
-            file_name = getattr(media, "file_name", None) or f"media_{job_id}.bin"
+            default_extensions = {
+                "photo": ".jpg",
+                "video": ".mp4",
+                "audio": ".mp3",
+                "voice": ".ogg",
+                "animation": ".mp4",
+                "video_note": ".mp4",
+                "sticker": ".webm" if getattr(media, "is_video", False) else ".webp",
+            }
+            fallback_name = f"{media_kind}_{job_id}{default_extensions.get(media_kind, '.bin')}"
+            file_name = getattr(media, "file_name", None) or fallback_name
             file_name = safe_filename(file_name)
-            file_size = getattr(media, "file_size", 0)
+            file_size = getattr(media, "file_size", 0) or 0
 
             source_type = "telegram_media" if file_size <= 20 * 1024 * 1024 else "telegram_large"
             sz_str = format_bytes(file_size)
@@ -706,7 +738,7 @@ class TelegramDriveBotApp:
 
         await message.reply_text(
             "ℹ️ لم يتم التعرف على المدخل.\n"
-            "يرجى إرسال رابط مباشر يبدأ بـ `http://` أو `https://`، أو ملف/مستند/فيديو مباشرة، أو استخدام `/help` لعرض الأوامر.",
+            "يرجى إرسال رابط مباشر يبدأ بـ `http://` أو `https://`، أو صورة/ملف/مستند/فيديو/صوت/ملصق، أو استخدام `/help` لعرض الأوامر.",
             parse_mode="Markdown",
             reply_markup=build_main_keyboard(),
         )
@@ -984,6 +1016,43 @@ class TelegramDriveBotApp:
             status = job.get("status")
             job_id = job["id"]
             temp_path = job.get("temp_path")
+
+            # Crash window: Drive final file may already be fully copied and verified,
+            # while the process died before persisting status="completed". Confirm the
+            # destination content before deciding whether another download is needed.
+            destination_path = job.get("destination_path")
+            expected_sha = job.get("sha256")
+            expected_size = job.get("size")
+            if status == "verifying" and destination_path and os.path.isfile(destination_path):
+                try:
+                    drive_sha, drive_size = hash_file(destination_path)
+                    if (
+                        drive_size > 0
+                        and expected_sha
+                        and expected_size is not None
+                        and drive_sha == expected_sha
+                        and drive_size == expected_size
+                    ):
+                        self.state.recover_job(
+                            job_id,
+                            "completed",
+                            sha256=drive_sha,
+                            size=drive_size,
+                            destination_path=destination_path,
+                            error=None,
+                        )
+                        if temp_path and os.path.exists(temp_path):
+                            try:
+                                os.remove(temp_path)
+                            except OSError:
+                                pass
+                        logger.info(
+                            "[job=%s] Recovery verified final Drive file; marked completed without re-download.",
+                            job_id,
+                        )
+                        continue
+                except OSError as exc:
+                    logger.warning("[job=%s] Could not verify existing Drive destination during recovery: %s", job_id, exc)
 
             if status in {"queued", "downloading"}:
                 if temp_path and os.path.exists(temp_path):

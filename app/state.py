@@ -118,25 +118,34 @@ class StateStore:
             logger.error("Failed creating corrupt state backup: %s", exc)
 
     def _save(self) -> None:
-        """Atomically write state using a temporary file in the same directory."""
+        """Atomically write state while retaining active jobs and the newest terminal history."""
         state_dir = os.path.dirname(self.state_path)
         os.makedirs(state_dir, exist_ok=True)
 
-        # Enforce history retention to keep JSON bounded without deleting active/recovery jobs
         jobs = self.data.get("jobs", [])
         if len(jobs) > self.max_history:
-            terminal_jobs = [j for j in jobs if j.get("status") in {"completed", "failed", "cancelled"}]
-            active_jobs = [j for j in jobs if j.get("status") not in {"completed", "failed", "cancelled"}]
-            excess = len(jobs) - self.max_history
-            if excess > 0 and terminal_jobs:
-                pruned_terminal = terminal_jobs[excess:]
-                self.data["jobs"] = active_jobs + pruned_terminal
+            terminal_states = {"completed", "failed", "cancelled"}
+            active_jobs = [job for job in jobs if job.get("status") not in terminal_states]
+            terminal_jobs = [job for job in jobs if job.get("status") in terminal_states]
+
+            # Retain the newest terminal records by timestamp. Do not slice by list
+            # position after reordering active jobs: that could discard the newest job.
+            terminal_jobs.sort(
+                key=lambda job: job.get("updated_at") or job.get("created_at") or "",
+                reverse=True,
+            )
+            available_terminal_slots = max(0, self.max_history - len(active_jobs))
+            retained_terminal_ids = {job.get("id") for job in terminal_jobs[:available_terminal_slots]}
+            self.data["jobs"] = [
+                job for job in jobs
+                if job.get("status") not in terminal_states or job.get("id") in retained_terminal_ids
+            ]
 
         self._recalculate_stats()
 
         tmp_fd, tmp_path = tempfile.mkstemp(dir=state_dir, prefix="state_", suffix=".tmp")
         try:
-            with open(tmp_fd, "w", encoding="utf-8") as f:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, indent=2, ensure_ascii=False)
             os.replace(tmp_path, self.state_path)
         except Exception:
