@@ -299,7 +299,7 @@ class TelegramDriveBotApp:
             f"⚡ العمليات الجارية: {active_cnt} | ⏳ في الانتظار: {queue_cnt}\n\n"
             "📥 *طريقة الاستخدام:*\n"
             "• أرسل أي رابط تحميل مباشر (`https://...`)\n"
-            "• أرسل أي ملف، فيديو، مستند، أو صوت عبر تيليجرام\n\n"
+            "• أرسل ملفاً أو مستنداً أو صورة أو فيديو أو صوتاً أو ملصقاً عبر تيليجرام\n\n"
             "🔘 يمكنك استخدام لوحة التحكم السريعة أدناه أو كتابة الأوامر مباشرة:"
         )
         await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=build_main_keyboard())
@@ -670,13 +670,51 @@ class TelegramDriveBotApp:
             logger.info("[job=%s] Accepted direct URL job into queue: %s (source: %s)", job_id, fname, sanitized_log_url)
             return
 
-        # Media Attachment
-        media = message.document or message.video or message.audio
+        # Media Attachment — support common Telegram file-bearing message types.
+        media = (
+            message.document
+            or message.video
+            or message.audio
+            or message.voice
+            or message.animation
+            or message.video_note
+            or message.sticker
+        )
+        media_kind = "media"
+        if message.photo:
+            # Telegram exposes photos as multiple sizes; download the largest available one.
+            media = max(message.photo, key=lambda photo: getattr(photo, "file_size", 0) or 0)
+            media_kind = "photo"
+        elif message.document:
+            media_kind = "document"
+        elif message.video:
+            media_kind = "video"
+        elif message.audio:
+            media_kind = "audio"
+        elif message.voice:
+            media_kind = "voice"
+        elif message.animation:
+            media_kind = "animation"
+        elif message.video_note:
+            media_kind = "video_note"
+        elif message.sticker:
+            media_kind = "sticker"
+
         if media:
             job_id = str(uuid.uuid4())[:8]
-            file_name = getattr(media, "file_name", None) or f"media_{job_id}.bin"
+            default_extensions = {
+                "photo": ".jpg",
+                "video": ".mp4",
+                "audio": ".mp3",
+                "voice": ".ogg",
+                "animation": ".mp4",
+                "video_note": ".mp4",
+                "sticker": ".webm" if getattr(media, "is_video", False) else ".webp",
+            }
+            fallback_name = f"{media_kind}_{job_id}{default_extensions.get(media_kind, '.bin')}"
+            file_name = getattr(media, "file_name", None) or fallback_name
             file_name = safe_filename(file_name)
-            file_size = getattr(media, "file_size", 0)
+            file_size = getattr(media, "file_size", 0) or 0
 
             source_type = "telegram_media" if file_size <= 20 * 1024 * 1024 else "telegram_large"
             sz_str = format_bytes(file_size)
@@ -706,7 +744,7 @@ class TelegramDriveBotApp:
 
         await message.reply_text(
             "ℹ️ لم يتم التعرف على المدخل.\n"
-            "يرجى إرسال رابط مباشر يبدأ بـ `http://` أو `https://`، أو ملف/مستند/فيديو مباشرة، أو استخدام `/help` لعرض الأوامر.",
+            "يرجى إرسال رابط مباشر يبدأ بـ `http://` أو `https://`، أو صورة/ملف/مستند/فيديو/صوت/ملصق، أو استخدام `/help` لعرض الأوامر.",
             parse_mode="Markdown",
             reply_markup=build_main_keyboard(),
         )
