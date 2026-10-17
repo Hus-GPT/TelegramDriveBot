@@ -28,7 +28,7 @@ from app.transfer import (
     validate_destination_directory,
     validate_url_security,
 )
-from app.bot import File2URLProvider, TelegramDriveBotApp
+from app.bot import File2URLProvider, TelegramDriveBotApp, extract_message_media
 from app.ui import (
     ProgressTracker,
     build_confirmation_keyboard,
@@ -330,6 +330,52 @@ def test_clean_orphan_drive_partials(temp_dirs):
 
     assert os.path.exists(part_active)
     assert os.path.exists(unrelated)
+
+
+# ---------------------------------------------------------
+# 5. Telegram media selection coverage
+# ---------------------------------------------------------
+
+def test_extract_message_media_selects_largest_photo():
+    small = type("Photo", (), {"file_size": 120, "file_id": "small"})()
+    large = type("Photo", (), {"file_size": 900, "file_id": "large"})()
+    message = type("Message", (), {"photo": [small, large]})()
+
+    media, kind = extract_message_media(message)
+
+    assert media is large
+    assert kind == "photo"
+
+
+@pytest.mark.parametrize(
+    ("attribute", "kind"),
+    [
+        ("voice", "voice"),
+        ("animation", "animation"),
+        ("video_note", "video_note"),
+        ("sticker", "sticker"),
+        ("document", "document"),
+        ("video", "video"),
+        ("audio", "audio"),
+    ],
+)
+def test_extract_message_media_supports_other_types(attribute, kind):
+    media_object = object()
+    message = type("Message", (), {attribute: media_object})()
+
+    media, actual_kind = extract_message_media(message)
+
+    assert media is media_object
+    assert actual_kind == kind
+
+
+def test_extract_message_media_returns_none_for_text_only_message():
+    message = type("Message", (), {})()
+
+    media, kind = extract_message_media(message)
+
+    assert media is None
+    assert kind == "media"
 
 
 # ---------------------------------------------------------
